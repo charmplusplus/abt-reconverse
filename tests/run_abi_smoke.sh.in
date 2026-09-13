@@ -1,0 +1,40 @@
+#!/bin/sh
+# Compile tests/abi_smoke.c with a C compiler against the INSTALLED prefix,
+# using pkg-config exactly the way Margo's build does, then run it.
+#
+# Deliberately not an add_executable(): building through the installed
+# argobots.pc is what proves the header is C-clean and the .pc is usable.
+# Run `make install` before `ctest`.
+set -eu
+
+CC_BIN="@CMAKE_C_COMPILER_FOR_TEST@"
+# macOS: ctest's environment has no SDKROOT, so name the sysroot explicitly.
+SYSROOT_FLAG="@ABT_TEST_SYSROOT_FLAG@"
+PREFIX="@CMAKE_INSTALL_PREFIX@"
+SRC="@CMAKE_CURRENT_SOURCE_DIR@/abi_smoke.c"
+WORK="@CMAKE_CURRENT_BINARY_DIR@"
+
+PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig"
+export PKG_CONFIG_PATH
+
+if [ ! -f "${PREFIX}/lib/pkgconfig/argobots.pc" ]; then
+    echo "abi_smoke: ${PREFIX}/lib/pkgconfig/argobots.pc missing - run 'make install' first" >&2
+    exit 1
+fi
+
+echo "pkg-config --modversion argobots: $(pkg-config --modversion argobots)"
+echo "pkg-config --cflags argobots:     $(pkg-config --cflags argobots)"
+echo "pkg-config --libs argobots:       $(pkg-config --libs argobots)"
+
+# pkg-config must also accept the version predicate Margo uses.
+pkg-config --atleast-version=1.2 argobots \
+    || { echo "abi_smoke: argobots.pc fails 'pkg-config --atleast-version=1.2'" >&2; exit 1; }
+
+set -x
+"${CC_BIN}" ${SYSROOT_FLAG} -std=c99 -Wall -Wextra -Werror \
+    $(pkg-config --cflags argobots) \
+    -o "${WORK}/abi_smoke" "${SRC}" \
+    $(pkg-config --libs argobots)
+set +x
+
+exec "${WORK}/abi_smoke"

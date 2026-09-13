@@ -1,0 +1,116 @@
+/* ABT_init / ABT_finalize / ABT_initialized and the unimplemented-call
+ * bookkeeping shared by every module. */
+#include "abti.h"
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <unistd.h>
+
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#endif
+
+namespace {
+std::atomic<const char *> g_first_unimplemented{nullptr};
+std::atomic<unsigned long> g_unimplemented_calls{0};
+std::mutex g_init_mutex;
+int g_init_refs = 0;
+} // namespace
+
+int ABTI_note_unimplemented(const char *name) noexcept {
+  g_unimplemented_calls.fetch_add(1, std::memory_order_relaxed);
+  const char *expected = nullptr;
+  g_first_unimplemented.compare_exchange_strong(expected, name, std::memory_order_release, std::memory_order_relaxed);
+  if (getenv("ABT_RECONVERSE_TRACE_NA")) fprintf(stderr, "abt-reconverse: %s not implemented\n", name);
+  return ABT_ERR_FEATURE_NA;
+}
+const char *ABTI_first_unimplemented(void) noexcept { return g_first_unimplemented.load(std::memory_order_acquire); }
+unsigned long ABTI_unimplemented_count(void) noexcept { return g_unimplemented_calls.load(std::memory_order_relaxed); }
+
+ABTI_global *ABTI_g = nullptr;
+
+static long env_long(const char *name, long dflt) {
+  const char *v = getenv(name);
+  if (!v || !*v) return dflt;
+  char *end; long x = strtol(v, &end, 10);
+  return (*end == 0 && x > 0) ? x : dflt;
+}
+
+/* every PE registers the same handlers in the same order; ranks > 0 here,
+ * rank 0 after ConverseInit returns */
+static void per_pe_setup() {
+  ABTI_register_handlers();
+  CcdCallOnConditionKeep(CcdPROCESSOR_STILL_IDLE, ABTI_xstream_idle_hook, nullptr);
+}
+
+static void startfn(int, char **) {
+  /* ranks > 0: unleased PEs sleep until an xstream is created on them */
+  per_pe_setup();
+  CsdSetSleepOnIdle(1);
+  CsdScheduler(-1);
+}
+
+extern "C" {
+
+int ABT_initialized(void) { return ABTI_initialized() ? ABT_SUCCESS : ABT_ERR_UNINITIALIZED; }
+
+int ABT_init(int argc, char **argv) {
+  std::lock_guard<std::mutex> g(g_init_mutex);
+  if (ABTI_initialized()) { g_init_refs++; return ABT_SUCCESS; }
+  ABTI_global *G = new ABTI_global();
+  long cores = sysconf(_SC_NPROCESSORS_ONLN);
+  if (cores < 1) cores = 1;
+  G->num_pes = (int)env_long("ABT_MAX_NUM_XSTREAMS", cores);
+  if (G->num_pes < 1) G->num_pes = 1;
+  G->default_stacksize = (size_t)env_long("ABT_THREAD_STACKSIZE", 2 * 1024 * 1024);
+  if (G->default_stacksize < 16384) G->default_stacksize = 16384;
+  G->xstreams.assign(G->num_pes, nullptr);
+  ABTI_g = G;
+
+  std::string pes = std::to_string(G->num_pes);
+  char *av[6];
+  av[0] = strdup("abt");
+  av[1] = strdup("+pe"); av[2] = strdup(pes.c_str());
+  av[3] = strdup("+backend_poll_thread"); av[4] = strdup(pes.c_str()); /* only PE 0 polls the comm backend */
+  av[5] = nullptr;
+  ConverseSetLibraryMode(1);
+  ConverseInit(5, av, startfn, /*usched=*/1, /*initret=*/1);
+  /* rank 0, the primary execution stream, continues here */
+  per_pe_setup();
+
+  int err;
+  ABTI_sched *sched = ABTI_sched_create_predef(ABT_SCHED_DEFAULT, 0, nullptr, &err);
+  ABTI_xstream *xs = new ABTI_xstream();
+  xs->rank = 0;
+  xs->state.store(ABT_XSTREAM_STATE_RUNNING);
+  xs->main_sched = sched;
+  xs->primary = true;
+  xs->cpubind = -1;
+  sched->used_by = xs;
+  G->xstreams[0] = xs;
+  G->primary_xstream = xs;
+  ABTI_tls_xstream = xs;
+  G->primary_thread = ABTI_thread_wrap_primary(CthSelf(), sched->pools[0]);
+  CsdSchedTableInstall(0, ABTI_sched_build_table(sched)); /* consumed when the primary first blocks */
+  CsdSetSleepOnIdle(0);
+  G->initialized.store(1, std::memory_order_release);
+  g_init_refs = 1;
+  return ABT_SUCCESS;
+}
+
+int ABT_finalize(void) {
+  std::lock_guard<std::mutex> g(g_init_mutex);
+  if (!ABTI_initialized()) return ABT_ERR_UNINITIALIZED;
+  if (--g_init_refs > 0) return ABT_SUCCESS;
+  if (!ABTI_on_pe() || ABTI_tls_xstream != ABTI_g->primary_xstream) return ABT_ERR_INV_XSTREAM;
+  if (ABTI_self_thread() != ABTI_g->primary_thread) return ABT_ERR_INV_THREAD;
+  {
+    std::lock_guard<std::mutex> gx(ABTI_g->xm);
+    for (int r = 1; r < ABTI_g->num_pes; r++) if (ABTI_g->xstreams[r]) return ABT_ERR_INV_XSTREAM; /* secondary xstreams must be freed */
+  }
+  ABTI_g->initialized.store(0, std::memory_order_release);
+  ConverseFinalize();
+  return ABT_SUCCESS;
+}
+
+} /* extern "C" */
