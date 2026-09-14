@@ -149,6 +149,11 @@ thread_local ABTI_thread *ABTI_tls_task = nullptr;
 void ABTI_pool_run_thread(ABTI_thread *t) {
   if (t->type == ABTI_THREAD_PRIMARY) ABTI_DBG("run primary");
   t->last_xstream = ABTI_tls_xstream;
+  /* resumed by a ULT (a scheduler runner, a stacked scheduler, an
+   * ABT_self_schedule caller): come back to it; resumed by the PE's own
+   * loop: come back to the PE's scheduling thread */
+  ABTI_thread *caller = ABTI_self_thread();
+  t->parent = (caller && caller->cth && !caller->is_task) ? caller->cth : nullptr;
   if (!t->cth) {
     /* a tasklet: run inline on this stack, then retire it */
     ABTI_thread *prev = ABTI_tls_task;
@@ -273,7 +278,8 @@ int ABT_pool_get_data(ABT_pool pool, void **data) {
 }
 int ABT_pool_add_sched(ABT_pool pool, ABT_sched sched) {
   ABTI_pool *p = ABTI_pool_get(pool); ABTI_CHECK_NULL(p, ABT_ERR_INV_POOL);
-  p->num_scheds.fetch_add(1); return ABT_SUCCESS;
+  ABTI_sched *s = ABTI_sched_get(sched); ABTI_CHECK_NULL(s, ABT_ERR_INV_SCHED);
+  return ABTI_sched_add_to_pool(s, p); /* the scheduler becomes a ULT unit of pool */
 }
 int ABT_pool_get_id(ABT_pool pool, int *id) {
   ABTI_pool *p = ABTI_pool_get(pool); ABTI_CHECK_NULL(p, ABT_ERR_INV_POOL);

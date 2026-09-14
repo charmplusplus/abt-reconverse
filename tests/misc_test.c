@@ -299,8 +299,8 @@ static void test_info_queries(void)
                ABT_TRUE,
            "ENABLED_EXTERNAL_THREAD is ABT_TRUE");
     EXPECT(query_value(after, ABT_INFO_QUERY_KIND_ENABLED_STACKABLE_SCHED) ==
-               ABT_FALSE,
-           "ENABLED_STACKABLE_SCHED is ABT_FALSE");
+               ABT_TRUE,
+           "ENABLED_STACKABLE_SCHED is ABT_TRUE");
     EXPECT(query_value(after, ABT_INFO_QUERY_KIND_ENABLED_DEBUG) == ABT_FALSE,
            "ENABLED_DEBUG is ABT_FALSE");
     EXPECT(query_value(after, ABT_INFO_QUERY_KIND_DEFAULT_SCHED_STACKSIZE) ==

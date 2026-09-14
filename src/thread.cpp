@@ -156,6 +156,14 @@ static ABT_thread_state map_state(ABTI_thread *t) {
 extern "C" {
 
 static int thread_create_impl(ABT_pool pool, void (*thread_func)(void *), void *arg, ABT_thread_attr attr, ABT_thread *newthread, bool is_task);
+/* a detached ULT with an explicit stack size, for the runtime's own units */
+extern "C++" int ABTI_thread_create_internal(ABT_pool pool, void (*fn)(void *), void *arg, size_t stacksize) {
+  ABT_thread_attr a; int r = ABT_thread_attr_create(&a); if (r != ABT_SUCCESS) return r;
+  ABT_thread_attr_set_stacksize(a, stacksize);
+  r = thread_create_impl(pool, fn, arg, a, nullptr, false);
+  ABT_thread_attr_free(&a);
+  return r;
+}
 struct create_req2 { ABT_pool pool; void (*fn)(void *); void *arg; ABT_thread_attr attr; ABT_thread *out; bool is_task; int ret; };
 static void create_on_pe2(void *a) { create_req2 *r = (create_req2 *)a; r->ret = thread_create_impl(r->pool, r->fn, r->arg, r->attr, r->out, r->is_task); }
 
@@ -536,7 +544,20 @@ int ABT_self_resume_suspend_to(ABT_thread thread) { ABTI_UNIMPLEMENTED("ABT_self
 int ABT_self_exit(void) { return ABT_thread_exit(); }
 int ABT_self_exit_to(ABT_thread thread) { ABTI_UNIMPLEMENTED("ABT_self_exit_to"); }
 int ABT_self_resume_exit_to(ABT_thread thread) { ABTI_UNIMPLEMENTED("ABT_self_resume_exit_to"); }
-int ABT_self_schedule(ABT_thread thread, ABT_pool pool) { ABTI_UNIMPLEMENTED("ABT_self_schedule"); }
+/* run `thread` as a child unit of the calling ULT; the caller resumes when
+ * the child yields, blocks or finishes (Argobots: ABTI_ythread_schedule) */
+int ABT_self_schedule(ABT_thread thread, ABT_pool pool) {
+  ABTI_thread *t = ABTI_thread_get(thread); ABTI_CHECK_NULL(t, ABT_ERR_INV_THREAD);
+  ABTI_thread *self = ABTI_self_thread();
+  if (!ABTI_on_pe() || !self || !self->cth) return ABT_ERR_INV_THREAD; /* not on a ULT */
+  if (t == self) return ABT_ERR_INV_THREAD;
+  if (!ABTI_is_null_handle(pool)) {
+    ABTI_pool *p = ABTI_pool_get(pool); ABTI_CHECK_NULL(p, ABT_ERR_INV_POOL);
+    ABTI_pool_associate(t, p);
+  }
+  ABTI_pool_run_thread(t); /* records the caller as the child's parent: it returns here */
+  return ABT_SUCCESS;
+}
 /* ---- tasklets: run as ULTs with a small stack. Argobots' tasklets cannot
  * yield or block; ours technically can, which only makes them more
  * permissive. Handles are ABT_thread handles (same opaque type). ---- */

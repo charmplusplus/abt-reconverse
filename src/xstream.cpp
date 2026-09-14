@@ -13,7 +13,14 @@
 thread_local ABTI_xstream *ABTI_tls_xstream = nullptr;
 thread_local CthThread ABTI_tls_runner = nullptr;
 
-CthThread ABTI_choose_fn(void) { return ABTI_tls_runner ? ABTI_tls_runner : CthGetSchedulingThread(); }
+/* where a suspending ULT returns to: the ULT that resumed it (set by
+ * ABTI_pool_run_thread at every resume, so it follows the ULT through
+ * stacked schedulers and ABT_self_schedule), else the PE's scheduler */
+CthThread ABTI_choose_fn(void) {
+  ABTI_thread *me = static_cast<ABTI_thread *>(CthGetUserData(CthSelf()));
+  if (me && me->parent) return me->parent;
+  return CthGetSchedulingThread();
+}
 
 /* give this PE's lease back: default table first, then the completion
  * message that the joiner waits for (handled after the table swap) */

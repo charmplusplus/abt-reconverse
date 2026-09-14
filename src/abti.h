@@ -88,6 +88,7 @@ struct ABTI_sched {
   ABT_sched_def def;
   ABT_sched_config config;
   CthThread runner;
+  bool in_pool = false;       /* ABT_pool_add_sched: running as a work unit of a pool */
 };
 enum { ABTI_SCHED_REQ_FINISH = 1, ABTI_SCHED_REQ_EXIT = 2 };
 
@@ -133,6 +134,7 @@ struct ABTI_thread {
   bool freed_by_exit;         /* detached: struct deleted in the exit fn */
   bool is_task;               /* created by ABT_task_create: a tasklet, run as a small ULT */
   ABTI_pool *blocked_pool;    /* pool whose num_blocked this thread holds while BLOCKED */
+  CthThread parent = nullptr; /* the ULT that resumed this one (a scheduler runner or ABT_self_schedule caller); it gets control back when this one suspends */
   std::atomic<int> blocked_counted{0};
   std::atomic<int> tstate{0}; /* tasklets (cth == NULL): CTH_STATE_READY/RUNNING/TERMINATED */
   std::jmp_buf exit_jmp;      /* ABT_thread_exit longjmps back to the entry frame */
@@ -218,6 +220,8 @@ void ABTI_pool_disassociate(ABTI_thread *t);
 int ABTI_poll_pool(void *ctx);                          /* CsdPollFn */
 int ABTI_poll_pool_prio(void *ctx);                     /* CsdPollFn: strict priority, ctx = ABTI_sched::PrioCtx* */
 void ABTI_pool_run_thread(ABTI_thread *t);              /* resume a popped thread on this PE */
+int ABTI_sched_add_to_pool(ABTI_sched *s, ABTI_pool *parent); /* stackable scheduler: run s as a ULT of parent */
+int ABTI_thread_create_internal(ABT_pool pool, void (*fn)(void *), void *arg, size_t stacksize);
 
 /* thread.cpp */
 void ABTI_thread_awaken_fn(CthThread cth, void *arg);   /* CthAwakenArgFn */

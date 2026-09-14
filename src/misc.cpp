@@ -450,7 +450,7 @@ int ABT_info_query_config(ABT_info_query_kind query_kind, void *val)
         *(ABT_bool *)val = ABT_TRUE;
         break;
     case ABT_INFO_QUERY_KIND_ENABLED_STACKABLE_SCHED:
-        *(ABT_bool *)val = ABT_FALSE;
+        *(ABT_bool *)val = ABT_TRUE;
         break;
     case ABT_INFO_QUERY_KIND_ENABLED_EXTERNAL_THREAD:
         *(ABT_bool *)val = ABT_TRUE;

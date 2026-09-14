@@ -176,3 +176,21 @@ when a red test appears:
 Earlier runs' full diagnoses (the join-drain deadlock, the re-init deadlock,
 the unsynchronized key vector, the external-thread recursive mutex, the
 tasklet self queries, the finalize drain) are in this file's git history.
+
+## Update 2026-09-14 (shim after 784d777): stackable schedulers implemented
+
+`ABT_pool_add_sched` and `ABT_self_schedule` are implemented (divergence D2
+closed): a scheduler added to a pool becomes a ULT unit of that pool whose
+body runs the scheduler's policy over the scheduler's own pools and returns
+when they hold no unit (blocked ULTs counted for pools it consumes alone, as
+Argobots' `ABTI_sched_has_unit`); while only blocked ULTs remain it holds the
+PE, parked in `CsdIdleWait` until a push. A resumed ULT returns to the ULT
+that resumed it: `ABTI_pool_run_thread` records the caller as the ULT's
+`parent` at every resume and `ABTI_choose_fn` returns it (the PE's
+scheduling thread when there is none). `ENABLED_STACKABLE_SCHED` answers
+`ABT_TRUE`.
+
+Result on the Mac (16 PEs): **57 pass, 4 skip, 0 fail of 61**. Newly passing:
+`sched_stack`, `sched_on_thread`, `xstream_set_main_sched`, `thread_create3`.
+Remaining skips: `pool_custom` (D3), `unit` (D1: still needs the 2.0 user
+pool interface), `thread_create4` and `ext_thread2` (D4: revive / exit_to).

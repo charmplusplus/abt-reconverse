@@ -116,6 +116,71 @@ CsdSchedTable ABTI_sched_build_table(ABTI_sched *s) {
   return CsdSchedTableCreate(entries.data(), n);
 }
 
+/* ---- stackable schedulers ---------------------------------------------
+ * ABT_pool_add_sched makes a scheduler a work unit of a pool.  As in Argobots
+ * (ABTI_ythread_create_sched) the unit is a ULT whose body runs the
+ * scheduler's policy over the scheduler's own pools; ULTs it resumes come
+ * back to it through ABTI_choose_fn (ABTI_pool_run_thread records the
+ * resuming ULT as their parent at every resume).  It returns to the
+ * parent scheduler when its pools hold no unit, blocked ULTs included for
+ * pools it consumes alone (ABTI_sched_has_unit); while only blocked ULTs
+ * remain it keeps the PE, as Argobots does (its basic loop sleeps 100 ns per
+ * empty pass) -- here the PE parks in CsdIdleWait until a push to one of the
+ * pools.  Handing the PE back to the parent while waiting would be a
+ * one-line change but changes the order units run in, so it is not done. */
+static bool sched_has_unit(ABTI_sched *s) {
+  for (ABTI_pool *p : s->pools) {
+    if (p->size() > 0) return true;
+    if (p->access == ABT_POOL_ACCESS_PRIV || p->num_scheds.load() == 1)
+      if (p->num_blocked.load() > 0) return true;
+  }
+  return false;
+}
+
+static ABTI_thread *sched_pop_by_policy(ABTI_sched *s) {
+  int n = (int)s->pools.size();
+  if (n == 0) return nullptr;
+  if (s->predef == ABT_SCHED_RANDWS && n > 1) {
+    if (ABTI_thread *t = s->pools[0]->pop()) return t;
+    return s->pools[1 + (int)(random() % (n - 1))]->pop();
+  }
+  /* BASIC, DEFAULT, BASIC_WAIT, PRIO: first non-empty pool in index order
+   * (Argobots' basic loop restarts from pools[0] after every unit) */
+  for (int i = 0; i < n; i++) if (ABTI_thread *t = s->pools[i]->pop()) return t;
+  return nullptr;
+}
+
+static void stacked_sched_main(void *arg) {
+  ABTI_sched *s = static_cast<ABTI_sched *>(arg);
+  ABTI_DBG("stacked sched %p start (%d pools)", (void *)s, (int)s->pools.size());
+  if (s->user_def) {
+    s->def.run(ABTI_sched_handle(s)); /* the user's loop decides when to stop (ABT_sched_has_to_stop) */
+  } else {
+    int rank = CmiMyRank();
+    for (;;) {
+      if (s->request.load() & ABTI_SCHED_REQ_EXIT) break;
+      if (ABTI_thread *t = sched_pop_by_policy(s)) { ABTI_pool_run_thread(t); continue; }
+      if (!sched_has_unit(s)) break; /* drained: finish (Argobots: "used in pool -> finish it anyway") */
+      /* only blocked ULTs left: hold the PE until one of them is pushed back */
+      for (ABTI_pool *p : s->pools) p->add_sleeper(rank);
+      bool ready = false;
+      for (ABTI_pool *p : s->pools) if (p->size() > 0) { ready = true; break; }
+      if (!ready) CsdIdleWait(0.010);
+      for (ABTI_pool *p : s->pools) p->remove_sleeper(rank);
+    }
+  }
+  ABTI_DBG("stacked sched %p end", (void *)s);
+  s->in_pool = false;
+}
+
+int ABTI_sched_add_to_pool(ABTI_sched *s, ABTI_pool *parent) {
+  if (s->in_pool || s->used_by) return ABT_ERR_INV_SCHED; /* Argobots: used != NOT_USED */
+  s->in_pool = true;
+  int r = ABTI_thread_create_internal(ABTI_pool_handle(parent), stacked_sched_main, s, 1024 * 1024);
+  if (r != ABT_SUCCESS) s->in_pool = false;
+  return r;
+}
+
 extern "C" {
 
 int ABT_sched_create_basic(ABT_sched_predef predef, int num_pools, ABT_pool *pools, ABT_sched_config config, ABT_sched *newsched) {
@@ -155,7 +220,7 @@ int ABT_sched_free(ABT_sched *sched) {
   ABTI_CHECK_NULL(sched, ABT_ERR_INV_SCHED);
   ABTI_sched *s = ABTI_sched_get(*sched);
   ABTI_CHECK_NULL(s, ABT_ERR_INV_SCHED);
-  if (s->used_by) return ABT_ERR_INV_SCHED; /* still running on an xstream */
+  if (s->used_by || s->in_pool) return ABT_ERR_INV_SCHED; /* still running on an xstream or as a pool unit */
   ABTI_sched_destroy(s);
   *sched = ABT_SCHED_NULL;
   return ABT_SUCCESS;
