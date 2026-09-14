@@ -404,6 +404,7 @@ int ABT_self_get_specific(ABT_key key, void **value) { return ABT_key_get(key, v
 int ABT_self_get_type(ABT_unit_type *type) {
   if (type) *type = ABT_UNIT_TYPE_EXT;
   ABTI_CHECK_INITIALIZED();
+  if (!ABTI_on_pe()) return ABT_ERR_INV_XSTREAM; /* 1.x: external thread reports EXT with this error */
   *type = ABTI_self_thread() ? ABT_UNIT_TYPE_THREAD : ABT_UNIT_TYPE_EXT; return ABT_SUCCESS;
 }
 int ABT_self_is_primary(ABT_bool *is_primary) {
