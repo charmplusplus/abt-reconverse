@@ -149,6 +149,15 @@ void ABTI_pool_run_thread(ABTI_thread *t) {
   CmiHandleMessage(CthGetToken(t->cth));
 }
 
+/* strict priority: a pool yields nothing while any higher-priority pool of
+ * its scheduler still holds queued work (Argobots' prio scheduler) */
+int ABTI_poll_pool_prio(void *ctx) {
+  ABTI_sched::PrioCtx *pc = static_cast<ABTI_sched::PrioCtx *>(ctx);
+  for (int i = 0; i < pc->idx; i++)
+    if (pc->sched->pools[i]->size() != 0) return 0;
+  return ABTI_poll_pool(pc->sched->pools[pc->idx]);
+}
+
 int ABTI_poll_pool(void *ctx) {
   ABTI_pool *p = static_cast<ABTI_pool *>(ctx);
   ABTI_thread *t = p->pop();

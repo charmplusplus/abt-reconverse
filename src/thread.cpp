@@ -119,18 +119,23 @@ static ABT_thread_state map_state(ABTI_thread *t) {
 
 extern "C" {
 
-struct create_req { ABT_pool pool; void (*fn)(void *); void *arg; ABT_thread_attr attr; ABT_thread *out; int ret; };
-static void create_on_pe(void *a) { create_req *r = (create_req *)a; r->ret = ABT_thread_create(r->pool, r->fn, r->arg, r->attr, r->out); }
+static int thread_create_impl(ABT_pool pool, void (*thread_func)(void *), void *arg, ABT_thread_attr attr, ABT_thread *newthread, bool is_task);
+struct create_req2 { ABT_pool pool; void (*fn)(void *); void *arg; ABT_thread_attr attr; ABT_thread *out; bool is_task; int ret; };
+static void create_on_pe2(void *a) { create_req2 *r = (create_req2 *)a; r->ret = thread_create_impl(r->pool, r->fn, r->arg, r->attr, r->out, r->is_task); }
 
 int ABT_thread_create(ABT_pool pool, void (*thread_func)(void *), void *arg, ABT_thread_attr attr, ABT_thread *newthread) {
+  return thread_create_impl(pool, thread_func, arg, attr, newthread, false);
+}
+
+static int thread_create_impl(ABT_pool pool, void (*thread_func)(void *), void *arg, ABT_thread_attr attr, ABT_thread *newthread, bool is_task) {
   ABTI_CHECK_INITIALIZED();
   ABTI_pool *p = ABTI_pool_get(pool);
   ABTI_CHECK_NULL(p, ABT_ERR_INV_POOL);
   if (!ABTI_on_pe()) {
     /* stacks and tokens are PE-owned: create on a PE and wait (Mercury
      * callbacks and Mochi clients do create ULTs from plain pthreads) */
-    create_req r{pool, thread_func, arg, attr, newthread, ABT_SUCCESS};
-    ABTI_run_on_pe(create_on_pe, &r);
+    create_req2 r{pool, thread_func, arg, attr, newthread, is_task, ABT_SUCCESS};
+    ABTI_run_on_pe(create_on_pe2, &r);
     return r.ret;
   }
   ABTI_thread *t = new ABTI_thread();
@@ -142,7 +147,7 @@ int ABT_thread_create(ABT_pool pool, void (*thread_func)(void *), void *arg, ABT
   t->pool = nullptr; t->unit = ABT_UNIT_NULL;
   t->last_xstream = nullptr; t->migrate_to = nullptr;
   t->freed_by_exit = t->type == ABTI_THREAD_DETACHED;
-  t->is_task = false;
+  t->is_task = is_task;
   t->cth = CthCreate(thread_main, t, (int)stacksize);
   CthSetUserData(t->cth, t);
   CthSetAwakenFn(t->cth, ABTI_thread_awaken_fn, t);
@@ -192,7 +197,8 @@ int ABT_thread_free_many(int num, ABT_thread *thread_list) {
 
 int ABT_thread_yield(void) {
   ABTI_CHECK_INITIALIZED();
-  if (!ABTI_self_thread()) return ABT_SUCCESS; /* external thread: no-op (Argobots 1.x) */
+  ABTI_thread *t = ABTI_self_thread();
+  if (!t || t->is_task) return ABT_SUCCESS; /* external thread or tasklet: no-op (Argobots 1.x) */
   CthYield();
   return ABT_SUCCESS;
 }
@@ -399,7 +405,15 @@ int ABT_self_get_xstream_rank(int *rank) {
   if (!ABTI_on_pe() || !ABTI_tls_xstream) return ABT_ERR_INV_XSTREAM;
   *rank = ABTI_tls_xstream->rank; return ABT_SUCCESS;
 }
-int ABT_self_get_thread(ABT_thread *thread) { return ABT_thread_self(thread); }
+int ABT_self_get_thread(ABT_thread *thread) {
+  /* 1.x: the calling work unit, ULT or tasklet (ABT_self_get_task is this) */
+  if (thread) *thread = ABT_THREAD_NULL;
+  ABTI_CHECK_INITIALIZED();
+  if (!ABTI_on_pe()) return ABT_ERR_INV_XSTREAM;
+  ABTI_thread *t = ABTI_self_thread();
+  if (!t) return ABT_ERR_INV_THREAD;
+  *thread = ABTI_thread_handle(t); return ABT_SUCCESS;
+}
 int ABT_self_get_thread_id(ABT_unit_id *id) { return ABT_thread_self_id(id); }
 int ABT_self_set_specific(ABT_key key, void *value) { return ABT_key_set(key, value); }
 int ABT_self_get_specific(ABT_key key, void **value) { return ABT_key_get(key, value); }
@@ -415,6 +429,7 @@ int ABT_self_is_primary(ABT_bool *is_primary) {
   ABTI_CHECK_INITIALIZED();
   if (!ABTI_on_pe()) return ABT_ERR_INV_XSTREAM; /* 1.x: external thread */
   ABTI_thread *t = ABTI_self_thread();
+  if (t && t->is_task) return ABT_ERR_INV_THREAD; /* 1.x: a tasklet is not a ULT */
   *is_primary = (t && t->type == ABTI_THREAD_PRIMARY) ? ABT_TRUE : ABT_FALSE; return ABT_SUCCESS;
 }
 int ABT_self_on_primary_xstream(ABT_bool *on_primary) {
@@ -487,14 +502,8 @@ int ABT_self_schedule(ABT_thread thread, ABT_pool pool) { ABTI_UNIMPLEMENTED("AB
  * yield or block; ours technically can, which only makes them more
  * permissive. Handles are ABT_thread handles (same opaque type). ---- */
 static int task_create_impl(ABT_pool pool, void (*fn)(void *), void *arg, ABT_task *newtask) {
-  ABT_thread th;
-  ABT_thread_attr attr; ABT_thread_attr_create(&attr);
-  ABT_thread_attr_set_stacksize(attr, 64 * 1024);
-  int r = ABT_thread_create(pool, fn, arg, attr, newtask ? &th : nullptr);
-  ABT_thread_attr_free(&attr);
-  if (r != ABT_SUCCESS) return r;
-  if (newtask) { ABTI_thread_get(th)->is_task = true; *newtask = th; }
-  return ABT_SUCCESS;
+  ABTI_thread_attr a{64 * 1024, nullptr, ABT_TRUE};
+  return thread_create_impl(pool, fn, arg, reinterpret_cast<ABT_thread_attr>(&a), newtask, true);
 }
 static inline ABTI_thread *task_get(ABT_task h) { ABTI_thread *t = ABTI_thread_get(h); return (t && t->is_task) ? t : nullptr; }
 

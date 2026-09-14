@@ -95,13 +95,19 @@ void ABTI_sched_destroy(ABTI_sched *s) {
 CsdSchedTable ABTI_sched_build_table(ABTI_sched *s) {
   std::vector<CsdPollEntry> entries;
   int n = (int)s->pools.size();
+  if (s->predef == ABT_SCHED_PRIO) {
+    /* strict priority by pool index, equal slots; each entry declines while a
+     * higher-priority pool has queued work */
+    s->prio_ctx.clear();
+    s->prio_ctx.reserve(n);
+    for (int i = 0; i < n; i++) s->prio_ctx.push_back(ABTI_sched::PrioCtx{s, i});
+    for (int i = 0; i < n; i++)
+      entries.push_back(CsdPollEntry{ABTI_poll_pool_prio, &s->prio_ctx[i], 16, "abt prio pool"});
+    return CsdSchedTableCreate(entries.data(), n);
+  }
   for (int i = 0; i < n; i++) {
     unsigned freq = 16;
-    switch (s->predef) {
-    case ABT_SCHED_PRIO: freq = (unsigned)(32 >> (i < 5 ? i : 5)); if (freq == 0) freq = 1; break;
-    case ABT_SCHED_RANDWS: freq = i == 0 ? 32 : 4; break;
-    default: break;
-    }
+    if (s->predef == ABT_SCHED_RANDWS) freq = i == 0 ? 32 : 4;
     entries.push_back(CsdPollEntry{ABTI_poll_pool, s->pools[i], freq, "abt pool"});
   }
   return CsdSchedTableCreate(entries.data(), n);

@@ -140,6 +140,14 @@ int ABT_finalize(void) {
   ABTI_global *G = ABTI_g;
   ABTI_xstream *xs = G->primary_xstream;
   ABTI_thread *pt = G->primary_thread;
+  /* work still queued in the primary's pools runs first (Argobots' finalize
+   * lets the primary scheduler drain); each yield puts us behind it */
+  for (;;) {
+    size_t queued = 0;
+    for (ABTI_pool *p : xs->main_sched->pools) queued += p->size();
+    if (queued == 0) break;
+    CthYield();
+  }
   G->initialized.store(0, std::memory_order_release);
   /* the primary ULT goes back to being a plain reconverse main thread */
   CthSetAwakenFn(pt->cth, nullptr, nullptr);

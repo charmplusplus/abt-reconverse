@@ -75,6 +75,8 @@ struct ABTI_sched {
   ABTI_xstream *used_by;      /* the xstream running this scheduler, or NULL */
   void *data;
   std::atomic<int> request{0}; /* ABTI_SCHED_REQ_* */
+  struct PrioCtx { ABTI_sched *sched; int idx; };
+  std::vector<PrioCtx> prio_ctx; /* poll contexts for ABT_SCHED_PRIO tables */
 };
 enum { ABTI_SCHED_REQ_FINISH = 1, ABTI_SCHED_REQ_EXIT = 2 };
 
@@ -188,6 +190,7 @@ void ABTI_pool_destroy(ABTI_pool *p);
 void ABTI_pool_associate(ABTI_thread *t, ABTI_pool *p); /* set t->pool (+ unit in user pools) */
 void ABTI_pool_disassociate(ABTI_thread *t);
 int ABTI_poll_pool(void *ctx);                          /* CsdPollFn */
+int ABTI_poll_pool_prio(void *ctx);                     /* CsdPollFn: strict priority, ctx = ABTI_sched::PrioCtx* */
 void ABTI_pool_run_thread(ABTI_thread *t);              /* resume a popped thread on this PE */
 
 /* thread.cpp */
