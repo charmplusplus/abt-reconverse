@@ -54,6 +54,7 @@ static void thread_exit_fn(void *arg) {
 
 void ABTI_thread_awaken_fn(CthThread cth, void *arg) {
   ABTI_thread *t = static_cast<ABTI_thread *>(arg);
+  if (t->type == ABTI_THREAD_PRIMARY) ABTI_DBG("wake primary -> pool %p", (void *)t->pool);
   /* a blocked ULT stops counting as blocked the moment it is made ready, as
    * in Argobots (ABTI_ythread_set_ready); counting it until it resumed made
    * ABT_pool_get_total_size overshoot and Margo's progress loop spin */
@@ -68,12 +69,38 @@ void ABTI_thread_awaken_fn(CthThread cth, void *arg) {
 }
 
 void ABTI_thread_block(ABTI_thread *self, CthVoidFn after, void *arg) {
+  if (self->type == ABTI_THREAD_SCHED) { CthSuspendBlocked(after, arg); return; } /* not a pool member */
   ABTI_pool *p = self->pool;
   p->num_blocked.fetch_add(1, std::memory_order_acq_rel);
   self->blocked_pool = p;
   self->blocked_counted.store(1, std::memory_order_release);
   CthSuspendBlocked(after, arg);
   /* the waker decremented num_blocked when it made us ready */
+}
+
+/* the runner of a user-defined scheduler: it may yield, block on barriers
+ * and mutexes (Argobots' "main scheduler can yield"); its wake goes to its
+ * own PE's queue so the PE's built-in scheduler resumes it (nothing else
+ * polls a runner) */
+static void runner_awaken_fn(CthThread cth, void *arg) {
+  ABTI_thread *t = static_cast<ABTI_thread *>(arg);
+  if (t->blocked_counted.exchange(0, std::memory_order_acq_rel))
+    t->blocked_pool->num_blocked.fetch_sub(1, std::memory_order_acq_rel);
+  CmiPushPE(t->last_xstream ? t->last_xstream->rank : CmiMyRank(), CthGetToken(cth));
+}
+ABTI_thread *ABTI_thread_wrap_runner(CthThread cth, ABTI_pool *pool) {
+  ABTI_thread *t = new ABTI_thread();
+  t->cth = cth;
+  t->type = ABTI_THREAD_SCHED;
+  t->fn = nullptr; t->arg = nullptr;
+  t->attr = ABTI_thread_attr{0, nullptr, ABT_FALSE};
+  t->id = ABTI_g->next_id.fetch_add(1);
+  t->pool = pool; t->unit = ABT_UNIT_NULL; /* not a member of the pool: no association */
+  t->last_xstream = ABTI_tls_xstream; t->migrate_to = nullptr;
+  t->freed_by_exit = false; t->is_task = false; t->blocked_pool = nullptr;
+  CthSetUserData(cth, t);
+  CthSetAwakenFn(cth, runner_awaken_fn, t);
+  return t;
 }
 
 ABTI_thread *ABTI_thread_wrap_primary(CthThread cth, ABTI_pool *pool) {
@@ -160,6 +187,7 @@ static int thread_create_impl(ABT_pool pool, void (*thread_func)(void *), void *
   t->cth = CthCreate(thread_main, t, (int)stacksize);
   CthSetUserData(t->cth, t);
   CthSetAwakenFn(t->cth, ABTI_thread_awaken_fn, t);
+  CthSetChooseFn(t->cth, ABTI_choose_fn); /* back to a user scheduler's runner if one owns this PE */
   if (t->type == ABTI_THREAD_NAMED) CthSetKeepOnExit(t->cth, 1);
   CthSetExitFn(t->cth, thread_exit_fn, t);
   ABTI_pool_associate(t, p);

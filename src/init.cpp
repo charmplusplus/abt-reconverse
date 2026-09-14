@@ -28,6 +28,7 @@ const char *ABTI_first_unimplemented(void) noexcept { return g_first_unimplement
 unsigned long ABTI_unimplemented_count(void) noexcept { return g_unimplemented_calls.load(std::memory_order_relaxed); }
 
 ABTI_global *ABTI_g = nullptr;
+int ABTI_debug = 0;
 
 static long env_long(const char *name, long dflt) {
   const char *v = getenv(name);
@@ -70,7 +71,15 @@ static bool g_runtime_started = false;
 /* the reconverse runtime is torn down once, when the process exits; ABT
  * objects are created and destroyed per ABT_init/ABT_finalize cycle */
 static void shutdown_runtime() {
-  if (g_runtime_started && ABTI_on_pe() && CmiMyRank() == 0) ConverseFinalize();
+  if (!(g_runtime_started && ABTI_on_pe() && CmiMyRank() == 0)) return;
+  /* user-defined schedulers own their PEs until their run loop returns:
+   * ask them to exit so the PEs can take part in the runtime shutdown */
+  if (ABTI_g) {
+    std::lock_guard<std::mutex> gx(ABTI_g->xm);
+    for (ABTI_xstream *x : ABTI_g->xstreams)
+      if (x && x->main_sched && x->main_sched->user_def) x->main_sched->request.fetch_or(ABTI_SCHED_REQ_EXIT);
+  }
+  ConverseFinalize();
 }
 
 static void start_runtime(int num_pes) {
@@ -96,6 +105,7 @@ int ABT_init(int argc, char **argv) {
   std::lock_guard<std::mutex> g(g_init_mutex);
   if (ABTI_initialized()) { g_init_refs++; return ABT_SUCCESS; }
   if (!ABTI_g) {
+    ABTI_debug = getenv("ABT_RECONVERSE_DEBUG") != nullptr;
     ABTI_global *G = new ABTI_global();
     G->num_pes = ABTI_num_pes_rule();
     G->default_stacksize = (size_t)env_long("ABT_THREAD_STACKSIZE", 2 * 1024 * 1024);
@@ -140,6 +150,7 @@ int ABT_finalize(void) {
   ABTI_global *G = ABTI_g;
   ABTI_xstream *xs = G->primary_xstream;
   ABTI_thread *pt = G->primary_thread;
+  ABTI_DBG("finalize: draining primary pools");
   /* work still queued in the primary's pools runs first (Argobots' finalize
    * lets the primary scheduler drain); each yield puts us behind it */
   for (;;) {

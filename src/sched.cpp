@@ -57,6 +57,8 @@ ABTI_sched *ABTI_sched_create_predef(ABT_sched_predef predef, int num_pools, ABT
   ABTI_sched *s = new ABTI_sched();
   s->predef = predef;
   s->user_def = false;
+  s->runner = nullptr;
+  s->config = ABT_SCHED_CONFIG_NULL;
   s->automatic = ABT_TRUE;
   s->event_freq = 50;
   s->used_by = nullptr;
@@ -81,6 +83,7 @@ ABTI_sched *ABTI_sched_create_predef(ABT_sched_predef predef, int num_pools, ABT
 }
 
 void ABTI_sched_destroy(ABTI_sched *s) {
+  if (s->user_def && s->def.free) s->def.free(ABTI_sched_handle(s));
   for (ABTI_pool *p : s->pools) {
     int left = p->num_scheds.fetch_sub(1) - 1;
     /* automatic pools go with their last scheduler, if nothing is left in
@@ -127,7 +130,24 @@ int ABT_sched_create_basic(ABT_sched_predef predef, int num_pools, ABT_pool *poo
 }
 
 int ABT_sched_create(ABT_sched_def *def, int num_pools, ABT_pool *pools, ABT_sched_config config, ABT_sched *newsched) {
-  ABTI_UNIMPLEMENTED("ABT_sched_create"); /* user-defined schedulers: Thallium only */
+  ABTI_CHECK_INITIALIZED();
+  ABTI_CHECK_NULL(def, ABT_ERR_INV_SCHED);
+  ABTI_CHECK_NULL(newsched, ABT_ERR_INV_ARG);
+  if (!def->run) return ABT_ERR_INV_SCHED;
+  int err;
+  ABTI_sched *s = ABTI_sched_create_predef(ABT_SCHED_BASIC, num_pools, pools, &err);
+  if (!s) return err;
+  s->user_def = true;
+  s->def = *def;
+  s->config = config;
+  s->runner = nullptr;
+  s->automatic = ABT_FALSE; /* ABT_sched_create's default (ABT_sched_config_automatic may raise it) */
+  if (def->init) { /* synchronously, as Argobots does: callers free the config right after */
+    int r = def->init(ABTI_sched_handle(s), config);
+    if (r != ABT_SUCCESS) { ABTI_sched_destroy(s); return r; }
+  }
+  *newsched = ABTI_sched_handle(s);
+  return ABT_SUCCESS;
 }
 
 int ABT_sched_free(ABT_sched *sched) {
@@ -181,7 +201,17 @@ int ABT_sched_has_to_stop(ABT_sched sched, ABT_bool *stop) {
   ABTI_sched *s = ABTI_sched_get(sched); ABTI_CHECK_NULL(s, ABT_ERR_INV_SCHED);
   int r = s->request.load();
   if (r & ABTI_SCHED_REQ_EXIT) { *stop = ABT_TRUE; return ABT_SUCCESS; }
-  if (r & ABTI_SCHED_REQ_FINISH) { size_t n; ABT_sched_get_total_size(sched, &n); *stop = n == 0 ? ABT_TRUE : ABT_FALSE; return ABT_SUCCESS; }
+  if (r & ABTI_SCHED_REQ_FINISH) {
+    /* Argobots' ABTI_sched_has_unit: blocked ULTs count only for pools this
+     * scheduler owns alone -- a pool shared with other schedulers (work
+     * stealing) may hold ULTs blocked on their behalf, e.g. the joiner */
+    size_t n = 0;
+    for (ABTI_pool *p : s->pools) {
+      n += p->size();
+      if (p->num_scheds.load() <= 1) { long b = p->num_blocked.load(); if (b > 0) n += (size_t)b; }
+    }
+    *stop = n == 0 ? ABT_TRUE : ABT_FALSE; return ABT_SUCCESS;
+  }
   *stop = ABT_FALSE; return ABT_SUCCESS;
 }
 /*

@@ -145,6 +145,7 @@ void ABTI_pool_associate(ABTI_thread *t, ABTI_pool *p) {
 }
 
 void ABTI_pool_run_thread(ABTI_thread *t) {
+  if (t->type == ABTI_THREAD_PRIMARY) ABTI_DBG("run primary");
   t->last_xstream = ABTI_tls_xstream;
   CmiHandleMessage(CthGetToken(t->cth));
 }

@@ -11,6 +11,44 @@
 #endif
 
 thread_local ABTI_xstream *ABTI_tls_xstream = nullptr;
+thread_local CthThread ABTI_tls_runner = nullptr;
+
+CthThread ABTI_choose_fn(void) { return ABTI_tls_runner ? ABTI_tls_runner : CthGetSchedulingThread(); }
+
+/* give this PE's lease back: default table first, then the completion
+ * message that the joiner waits for (handled after the table swap) */
+static void send_pe_msg(int rank, ABTI_xstream *xs, int op, int cpuid, int handler);
+void ABTI_xstream_release(ABTI_xstream *xs) {
+  int rank = CmiMyRank();
+  ABTI_tls_xstream = nullptr;
+  CsdSetSleepOnIdle(1);
+  CsdSchedTableInstall(rank, CsdSchedTableCreate(nullptr, 0));
+  send_pe_msg(rank, xs, 0, -1, ABTI_g->release_handler.load());
+}
+
+/* body of the runner ULT: the user's scheduler loop owns this PE until it
+ * returns (ABT_sched_has_to_stop), then the lease is released unless the
+ * scheduler was merely replaced */
+static void sched_runner(void *arg) {
+  ABTI_sched *s = static_cast<ABTI_sched *>(arg);
+  ABTI_DBG("runner start sched=%p", (void *)s);
+  ABTI_tls_runner = CthSelf();
+  ABTI_thread *me = ABTI_thread_wrap_runner(CthSelf(), s->pools.empty() ? nullptr : s->pools[0]);
+  s->def.run(ABTI_sched_handle(s)); /* init already ran in ABT_sched_create */
+  ABTI_DBG("runner end sched=%p", (void *)s);
+  ABTI_tls_runner = nullptr;
+  s->runner = nullptr;
+  ABTI_xstream *xs = ABTI_tls_xstream;
+  CthSetUserData(CthSelf(), nullptr);
+  delete me;
+  if (xs && xs->main_sched == s) ABTI_xstream_release(xs);
+}
+
+void ABTI_start_runner(ABTI_sched *s) {
+  CthThread u = CthCreate(sched_runner, s, 1024 * 1024);
+  s->runner = u;
+  CthAwaken(u); /* the PE's scheduler resumes it; it then owns the PE */
+}
 
 struct ABTI_pe_msg {
   char hdr[CmiMsgHeaderSizeBytes];
@@ -58,6 +96,7 @@ static void lease_handler(void *vm) {
   m->xs->state.store(ABT_XSTREAM_STATE_RUNNING);
   CsdSetSleepOnIdle(0); /* a leased PE spins or blocks on its pool, as Argobots does */
   if (m->xs->cpubind >= 0) CmiSetCPUAffinity(m->xs->cpubind);
+  if (m->xs->main_sched->user_def) ABTI_start_runner(m->xs->main_sched);
   CmiFree(m);
 }
 static void affinity_handler(void *vm) {
@@ -103,6 +142,7 @@ static void release_handler(void *vm) {
   ABTI_pe_msg *m = (ABTI_pe_msg *)vm;
   ABTI_xstream *xs = m->xs;
   CmiFree(m);
+  ABTI_DBG("release complete rank %d", xs->rank);
   xs->main_sched->used_by = nullptr;
   xs->state.store(ABT_XSTREAM_STATE_TERMINATED);
   std::vector<CthThread> joiners;
@@ -118,13 +158,9 @@ static void release_handler(void *vm) {
 void ABTI_xstream_idle_hook(void *) {
   ABTI_xstream *xs = ABTI_tls_xstream;
   if (!xs) return;
+  if (xs->main_sched->user_def) return; /* the runner owns the loop and the release */
   if (xs->finishing.load(std::memory_order_acquire) && pools_drained(xs->main_sched)) {
-    /* release the lease: default table first, then the completion message */
-    int rank = CmiMyRank();
-    ABTI_tls_xstream = nullptr;
-    CsdSetSleepOnIdle(1);
-    CsdSchedTableInstall(rank, CsdSchedTableCreate(nullptr, 0));
-    send_pe_msg(rank, xs, 0, -1, ABTI_g->release_handler.load());
+    ABTI_xstream_release(xs);
     return;
   }
   if (xs->main_sched->predef == ABT_SCHED_BASIC_WAIT && !xs->main_sched->pools.empty()) {
@@ -157,9 +193,11 @@ void ABTI_xstream_idle_hook(void *) {
 
 void ABTI_xstream_install(ABTI_xstream *xs) {
   /* lease first, table second: both travel through the PE's queue in order,
-   * so the PE knows its xstream before the new table can pop a ULT */
-  send_pe_msg(xs->rank, xs, ABTI_OP_LEASE, xs->cpubind, ABTI_g->lease_handler);
-  CsdSchedTableInstall(xs->rank, ABTI_sched_build_table(xs->main_sched));
+   * so the PE knows its xstream before the new table can pop a ULT. A user
+   * scheduler gets the built-in table only: its own loop pops the pools. */
+  send_pe_msg(xs->rank, xs, ABTI_OP_LEASE, xs->cpubind, ABTI_g->lease_handler.load());
+  if (xs->main_sched->user_def) CsdSchedTableInstall(xs->rank, CsdSchedTableCreate(nullptr, 0));
+  else CsdSchedTableInstall(xs->rank, ABTI_sched_build_table(xs->main_sched));
 }
 
 int ABTI_xstream_lease(ABTI_sched *sched, int want_rank, ABTI_xstream **out) {
@@ -185,10 +223,12 @@ int ABTI_xstream_lease(ABTI_sched *sched, int want_rank, ABTI_xstream **out) {
 }
 
 static int join_impl(ABTI_xstream *x) {
+  ABTI_DBG("join xstream rank %d", x->rank);
   if (x->primary) return ABT_ERR_INV_XSTREAM;
   if (ABTI_tls_xstream == x && ABTI_on_pe()) return ABT_ERR_INV_XSTREAM; /* cannot join self */
   if (x->finished.load(std::memory_order_acquire)) return ABT_SUCCESS;
   x->finishing.store(1, std::memory_order_release);
+  if (x->main_sched) x->main_sched->request.fetch_or(ABTI_SCHED_REQ_FINISH); /* ABT_sched_has_to_stop in a user scheduler */
   ABTI_thread *self = ABTI_self_thread();
   if (self) {
     x->jm.lock();
@@ -273,10 +313,19 @@ int ABT_xstream_set_main_sched(ABT_xstream xstream, ABT_sched sched) {
   if (s->used_by && s->used_by != x) return ABT_ERR_INV_SCHED;
   ABTI_sched *old = x->main_sched;
   if (old == s) return ABT_SUCCESS;
+  ABTI_DBG("set_main_sched rank %d user=%d", x->rank, (int)s->user_def);
   x->main_sched = s;
   s->used_by = x;
   if (old) old->used_by = nullptr;
-  CsdSchedTableInstall(x->rank, ABTI_sched_build_table(s));
+  if (s->user_def) {
+    CsdSchedTableInstall(x->rank, CsdSchedTableCreate(nullptr, 0));
+    if (old && old->user_def) old->request.fetch_or(ABTI_SCHED_REQ_EXIT); /* its runner returns, ours starts after */
+    if (ABTI_on_pe() && CmiMyRank() == x->rank) ABTI_start_runner(s);
+    else send_pe_msg(x->rank, x, ABTI_OP_LEASE, x->cpubind, ABTI_g->lease_handler.load());
+  } else {
+    if (old && old->user_def) old->request.fetch_or(ABTI_SCHED_REQ_EXIT);
+    CsdSchedTableInstall(x->rank, ABTI_sched_build_table(s));
+  }
   /* the caller, if it lives in one of the old pools, moves to pools[0] */
   ABTI_thread *self = ABTI_self_thread();
   if (self && old && !s->pools.empty()) {
@@ -319,7 +368,14 @@ int ABT_xstream_is_primary(ABT_xstream xstream, ABT_bool *is_primary) {
   ABTI_xstream *x = ABTI_xstream_get(xstream); ABTI_CHECK_NULL(x, ABT_ERR_INV_XSTREAM);
   *is_primary = x->primary ? ABT_TRUE : ABT_FALSE; return ABT_SUCCESS;
 }
-int ABT_xstream_check_events(ABT_sched sched) { return ABT_SUCCESS; }
+int ABT_xstream_check_events(ABT_sched sched) {
+  /* From a user scheduler's run loop: let this PE's own runtime queues run
+   * (table installs, leases, exit) -- one sweep of the built-in table until
+   * empty. From anywhere else (a ULT, as Argobots' tests do) it processes no
+   * work: Argobots only handles join/cancel requests there. */
+  if (ABTI_on_pe() && ABTI_tls_runner && ABTI_tls_runner == CthSelf()) CsdSchedulePoll();
+  return ABT_SUCCESS;
+}
 #ifdef __APPLE__
 #define ABTI_AFFINITY_NA 1 /* no thread binding on macOS: native Argobots answers FEATURE_NA */
 #else
@@ -354,7 +410,15 @@ int ABT_xstream_get_affinity(ABT_xstream xstream, int max_cpuids, int *cpuids, i
 int ABT_xstream_revive(ABT_xstream xstream) { ABTI_UNIMPLEMENTED("ABT_xstream_revive"); }
 int ABT_xstream_exit(void) { ABTI_UNIMPLEMENTED("ABT_xstream_exit"); }
 int ABT_xstream_cancel(ABT_xstream xstream) { ABTI_UNIMPLEMENTED("ABT_xstream_cancel"); }
-int ABT_xstream_run_unit(ABT_unit unit, ABT_pool pool) { ABTI_UNIMPLEMENTED("ABT_xstream_run_unit"); }
+int ABT_xstream_run_unit(ABT_unit unit, ABT_pool pool) {
+  ABT_thread th;
+  int r = ABT_unit_get_thread(unit, &th);
+  if (r != ABT_SUCCESS) return r;
+  ABTI_thread *t = ABTI_thread_get(th);
+  ABTI_CHECK_NULL(t, ABT_ERR_INV_UNIT);
+  ABTI_pool_run_thread(t); /* resumes on this stack; the ULT returns here when it suspends */
+  return ABT_SUCCESS;
+}
 int ABT_xstream_barrier_create(uint32_t num_waiters, ABT_xstream_barrier *newbarrier) { ABTI_UNIMPLEMENTED("ABT_xstream_barrier_create"); }
 int ABT_xstream_barrier_free(ABT_xstream_barrier *barrier) { ABTI_UNIMPLEMENTED("ABT_xstream_barrier_free"); }
 int ABT_xstream_barrier_wait(ABT_xstream_barrier barrier) { ABTI_UNIMPLEMENTED("ABT_xstream_barrier_wait"); }

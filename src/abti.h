@@ -17,10 +17,15 @@
 #include <csetjmp>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <deque>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+
+/* ---- debug trace: ABT_RECONVERSE_DEBUG=1 prints key runtime events to stderr ---- */
+extern int ABTI_debug;
+#define ABTI_DBG(...) do { if (ABTI_debug) { fprintf(stderr, "[abt pe%d] ", CmiIsPeThread() ? CmiMyRank() : -1); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
 
 /* ---- unimplemented-call bookkeeping (kept from the skeleton) ---- */
 int ABTI_note_unimplemented(const char *name) noexcept;
@@ -77,6 +82,12 @@ struct ABTI_sched {
   std::atomic<int> request{0}; /* ABTI_SCHED_REQ_* */
   struct PrioCtx { ABTI_sched *sched; int idx; };
   std::vector<PrioCtx> prio_ctx; /* poll contexts for ABT_SCHED_PRIO tables */
+  /* user-defined scheduler (ABT_sched_create with an ABT_sched_def): its run
+   * loop executes on a runner ULT that owns the PE; ULTs it resumes come
+   * back to it through ABTI_choose_fn */
+  ABT_sched_def def;
+  ABT_sched_config config;
+  CthThread runner;
 };
 enum { ABTI_SCHED_REQ_FINISH = 1, ABTI_SCHED_REQ_EXIT = 2 };
 
@@ -94,7 +105,7 @@ struct ABTI_xstream {
   std::vector<CthThread> joiners;
 };
 
-enum ABTI_thread_type { ABTI_THREAD_PRIMARY, ABTI_THREAD_NAMED, ABTI_THREAD_DETACHED };
+enum ABTI_thread_type { ABTI_THREAD_PRIMARY, ABTI_THREAD_NAMED, ABTI_THREAD_DETACHED, ABTI_THREAD_SCHED };
 
 struct ABTI_thread_attr {
   size_t stacksize;           /* 0 = default */
@@ -152,6 +163,10 @@ struct ABTI_global {
 };
 extern ABTI_global *ABTI_g;
 extern thread_local ABTI_xstream *ABTI_tls_xstream; /* per PE */
+extern thread_local CthThread ABTI_tls_runner;       /* the user scheduler running on this PE, or NULL */
+CthThread ABTI_choose_fn(void);                      /* CthThFn for shim ULTs */
+void ABTI_start_runner(ABTI_sched *s);               /* on the PE that will run it */
+void ABTI_xstream_release(ABTI_xstream *xs);         /* on the PE: give the lease back */
 
 /* ---- helpers ---- */
 inline bool ABTI_initialized() { return ABTI_g && ABTI_g->initialized.load(std::memory_order_acquire); }
@@ -201,6 +216,7 @@ void ABTI_thread_block(ABTI_thread *self, CthVoidFn after, void *arg); /* blocke
 int ABTI_thread_join_impl(ABTI_thread *t);
 void ABTI_thread_destroy(ABTI_thread *t);
 ABTI_thread *ABTI_thread_wrap_primary(CthThread cth, ABTI_pool *pool);
+ABTI_thread *ABTI_thread_wrap_runner(CthThread cth, ABTI_pool *pool); /* a user scheduler's loop thread, pinned to its PE */
 
 /* sched.cpp */
 ABTI_sched *ABTI_sched_create_predef(ABT_sched_predef predef, int num_pools, ABT_pool *pools, int *err);
