@@ -471,7 +471,7 @@ int ABT_thread_cancel(ABT_thread thread) { ABTI_UNIMPLEMENTED("ABT_thread_cancel
 int ABT_self_resume_yield_to(ABT_thread thread) { ABTI_UNIMPLEMENTED("ABT_self_resume_yield_to"); }
 int ABT_self_suspend_to(ABT_thread thread) { ABTI_UNIMPLEMENTED("ABT_self_suspend_to"); }
 int ABT_self_resume_suspend_to(ABT_thread thread) { ABTI_UNIMPLEMENTED("ABT_self_resume_suspend_to"); }
-int ABT_self_exit(void) { ABTI_UNIMPLEMENTED("ABT_self_exit"); }
+int ABT_self_exit(void) { return ABT_thread_exit(); }
 int ABT_self_exit_to(ABT_thread thread) { ABTI_UNIMPLEMENTED("ABT_self_exit_to"); }
 int ABT_self_resume_exit_to(ABT_thread thread) { ABTI_UNIMPLEMENTED("ABT_self_resume_exit_to"); }
 int ABT_self_schedule(ABT_thread thread, ABT_pool pool) { ABTI_UNIMPLEMENTED("ABT_self_schedule"); }
