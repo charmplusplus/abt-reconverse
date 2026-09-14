@@ -48,6 +48,7 @@ static void startfn(int, char **) {
   /* ranks > 0: unleased PEs sleep until an xstream is created on them */
   per_pe_setup();
   CsdSetSleepOnIdle(1);
+  CmiInitTracePhase(CmiMyRank(), "abt-startfn-sched");
   CsdScheduler(-1);
 }
 
