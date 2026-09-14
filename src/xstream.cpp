@@ -4,6 +4,7 @@
 #include "abti.h"
 #include <cstring>
 #include <sched.h>
+#include <time.h>
 
 #if defined(__clang__) || defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wunused-parameter"
@@ -144,7 +145,14 @@ void ABTI_xstream_idle_hook(void *) {
       p0->remove_sleeper(rank);
     }
     if (t) { CsdReleaseIdle(); ABTI_pool_run_thread(t); }
+    return;
   }
+  /* spinning schedulers (basic/default/prio/randws): Argobots' basic
+   * scheduler nanosleeps ABT_SCHED_SLEEP_NSEC (100 ns) per empty pass, which
+   * on macOS yields the core for tens of microseconds; match it so an idle
+   * xstream does not pin a core */
+  struct timespec ts = {0, 100};
+  nanosleep(&ts, nullptr);
 }
 
 void ABTI_xstream_install(ABTI_xstream *xs) {
