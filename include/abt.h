@@ -1,6 +1,11 @@
 /* -*- Mode: C; c-basic-offset:4 ; indent-tabs-mode:nil ; -*- */
 /*
  * See COPYRIGHT in top-level directory.
+ *
+ * abt-reconverse: this header is derived from Argobots' abt.h.in (Argobots
+ * 1.2, https://github.com/pmodels/argobots), with the configure-time
+ * substitutions applied and <time.h> included; the Argobots license is in
+ * COPYRIGHT.argobots. The implementation behind it (src/) is new code.
  */
 
 #ifndef ABT_H_INCLUDED

@@ -65,3 +65,13 @@ function; mutex/cond/eventual/rwlock/barrier/future are spinlock + wait
 list with the unlock as a post-switch action and Argobots' 64-byte static
 layouts. Divergences: PE count fixed at init, no runtime ULT migration
 between PEs, no revive/cancel/tool interface/stack unwinding.
+
+## License and provenance
+
+`include/abt.h` is derived from Argobots' `abt.h.in` (Copyright UChicago
+Argonne, LLC; BSD-style license in `COPYRIGHT.argobots`, which requires
+modifications to be noted: see the header comment). The upstream Argobots
+`test/basic` programs are compiled from an Argobots checkout, never copied.
+The implementation in `src/` and the tests in `tests/` are new code by the
+Parallel Programming Laboratory, UIUC; their license follows Reconverse's
+(to be stated here once set by PPL).
