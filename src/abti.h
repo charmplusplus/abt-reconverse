@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <csetjmp>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -115,6 +116,7 @@ struct ABTI_thread {
   std::vector<CthThread> joiners;
   std::vector<void *> keys;   /* ABT_key values, indexed by key id */
   bool freed_by_exit;         /* detached: struct deleted in the exit fn */
+  std::jmp_buf exit_jmp;      /* ABT_thread_exit longjmps back to the entry frame */
 };
 
 struct ABTI_key {

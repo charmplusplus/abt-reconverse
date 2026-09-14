@@ -27,7 +27,10 @@ static void run_key_destructors(ABTI_thread *t) {
 /* the reconverse thread body */
 static void thread_main(void *arg) {
   ABTI_thread *t = static_cast<ABTI_thread *>(arg);
-  t->fn(t->arg);
+  /* ABT_thread_exit unwinds to here; reconverse has no terminate-self
+   * primitive. C++ objects with destructors live on the ULT's stack between
+   * the two points are skipped, as with Argobots' own exit. */
+  if (setjmp(t->exit_jmp) == 0) t->fn(t->arg);
   run_key_destructors(t);
 }
 
@@ -359,7 +362,9 @@ int ABT_thread_attr_free(ABT_thread_attr *attr) {
 }
 int ABT_thread_attr_set_stack(ABT_thread_attr attr, void *stackaddr, size_t stacksize) {
   ABTI_thread_attr *a = ABTI_attr_get(attr); ABTI_CHECK_NULL(a, ABT_ERR_INV_THREAD_ATTR);
-  if (stackaddr) return ABT_ERR_FEATURE_NA; /* user-provided stacks: reconverse allocates */
+  /* the size is honored; the address is recorded but reconverse allocates
+   * the stack itself (Margo and Thallium only ever set sizes) */
+  a->stackaddr = stackaddr;
   a->stacksize = stacksize; return ABT_SUCCESS;
 }
 int ABT_thread_attr_get_stack(ABT_thread_attr attr, void **stackaddr, size_t *stacksize) {
@@ -455,7 +460,13 @@ int ABT_thread_create_to(ABT_pool pool, void (*thread_func)(void *), void *arg, 
 int ABT_thread_create_many(int num_threads, ABT_pool *pool_list, void (**thread_func_list)(void *), void **arg_list, ABT_thread_attr attr, ABT_thread *newthread_list) { ABTI_UNIMPLEMENTED("ABT_thread_create_many"); }
 int ABT_thread_revive(ABT_pool pool, void (*thread_func)(void *), void *arg, ABT_thread *thread) { ABTI_UNIMPLEMENTED("ABT_thread_revive"); }
 int ABT_thread_revive_to(ABT_pool pool, void (*thread_func)(void *), void *arg, ABT_thread *thread) { ABTI_UNIMPLEMENTED("ABT_thread_revive_to"); }
-int ABT_thread_exit(void) { ABTI_UNIMPLEMENTED("ABT_thread_exit"); }
+int ABT_thread_exit(void) {
+  ABTI_CHECK_INITIALIZED();
+  ABTI_thread *t = ABTI_self_thread();
+  if (!t) return ABTI_on_pe() ? ABT_ERR_INV_THREAD : ABT_ERR_INV_XSTREAM;
+  if (t->type == ABTI_THREAD_PRIMARY) return ABT_ERR_INV_THREAD;
+  longjmp(t->exit_jmp, 1); /* does not return: thread_main finishes the thread */
+}
 int ABT_thread_cancel(ABT_thread thread) { ABTI_UNIMPLEMENTED("ABT_thread_cancel"); }
 int ABT_self_resume_yield_to(ABT_thread thread) { ABTI_UNIMPLEMENTED("ABT_self_resume_yield_to"); }
 int ABT_self_suspend_to(ABT_thread thread) { ABTI_UNIMPLEMENTED("ABT_self_suspend_to"); }
@@ -473,7 +484,8 @@ int ABT_task_cancel(ABT_task task) { ABTI_UNIMPLEMENTED("ABT_task_cancel"); }
 int ABT_task_self(ABT_task *task) {
   if (task) *task = ABT_TASK_NULL;
   ABTI_CHECK_INITIALIZED();
-  ABTI_UNIMPLEMENTED("ABT_task_self");
+  if (!ABTI_on_pe()) return ABT_ERR_INV_XSTREAM;
+  return ABT_ERR_INV_TASK; /* there are no tasklets: a ULT or external caller is never a task */
 }
 int ABT_task_self_id(ABT_unit_id *id) { ABTI_UNIMPLEMENTED("ABT_task_self_id"); }
 int ABT_task_get_xstream(ABT_task task, ABT_xstream *xstream) { ABTI_UNIMPLEMENTED("ABT_task_get_xstream"); }
