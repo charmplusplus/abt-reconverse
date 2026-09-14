@@ -48,6 +48,15 @@ foreach(t core_smoke sync_smoke misc_test)
   set_tests_properties(${t} PROPERTIES TIMEOUT 120)
 endforeach()
 
+# The DAOS mock: DAOS's own API sequence (user-defined scheduler, three pools
+# per xstream, the engine's run loop) reproduced without any DAOS code.
+# See tests/daos-mock/README.md for the DAOS file:line each part mirrors.
+add_executable(daos_mock daos-mock/daos_mock.c)
+target_link_libraries(daos_mock PRIVATE abt_static)
+target_include_directories(daos_mock PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME daos_mock COMMAND daos_mock)
+set_tests_properties(daos_mock PROPERTIES TIMEOUT 180)
+
 # The Argobots reference tests (upstream test/basic), compiled in place against
 # the shim.  They are a conformance measurement, not a gate: many fail while
 # the shim is incomplete, so they are all named argobots_* and can be run on
