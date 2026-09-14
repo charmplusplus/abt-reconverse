@@ -526,7 +526,15 @@ int ABT_self_get_thread_func(void (**thread_func)(void *)) {
 }
 
 /* not supported */
-int ABT_thread_create_to(ABT_pool pool, void (*thread_func)(void *), void *arg, ABT_thread_attr attr, ABT_thread *newthread) { ABTI_UNIMPLEMENTED("ABT_thread_create_to"); }
+/* create a ULT and yield to it: the new ULT is pushed to pool and the caller
+ * yields (goes to the back of its own pool), so the scheduler runs the new
+ * one next when the two share a pool */
+int ABT_thread_create_to(ABT_pool pool, void (*thread_func)(void *), void *arg, ABT_thread_attr attr, ABT_thread *newthread) {
+  int r = thread_create_impl(pool, thread_func, arg, attr, newthread, false);
+  if (r != ABT_SUCCESS) return r;
+  if (ABTI_can_block(ABTI_self_thread())) return ABT_thread_yield();
+  return ABT_SUCCESS;
+}
 int ABT_thread_create_many(int num_threads, ABT_pool *pool_list, void (**thread_func_list)(void *), void **arg_list, ABT_thread_attr attr, ABT_thread *newthread_list) { ABTI_UNIMPLEMENTED("ABT_thread_create_many"); }
 int ABT_thread_revive(ABT_pool pool, void (*thread_func)(void *), void *arg, ABT_thread *thread) { ABTI_UNIMPLEMENTED("ABT_thread_revive"); }
 int ABT_thread_revive_to(ABT_pool pool, void (*thread_func)(void *), void *arg, ABT_thread *thread) { ABTI_UNIMPLEMENTED("ABT_thread_revive_to"); }

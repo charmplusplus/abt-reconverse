@@ -434,7 +434,20 @@ int ABT_xstream_set_affinity(ABT_xstream xstream, int num_cpuids, int *cpuids) {
   ABTI_xstream *x = ABTI_xstream_get(xstream); ABTI_CHECK_NULL(x, ABT_ERR_INV_XSTREAM);
   if (ABTI_AFFINITY_NA) return ABT_ERR_FEATURE_NA;
   x->affinity.assign(cpuids, cpuids + (num_cpuids > 0 ? num_cpuids : 0));
-  if (num_cpuids > 0) return ABT_xstream_set_cpubind(xstream, cpuids[0]); /* one PE binds to one core */
+  if (num_cpuids > 0) {
+#if !ABTI_AFFINITY_NA
+    /* Argobots hands the whole list to the OS, which accepts a mask that
+     * merely intersects the process cpuset; one PE binds to one core here, so
+     * bind the first listed CPU the process may use (Slurm cpusets often
+     * exclude CPU 0, and Argobots' test harness lists 0..15) */
+    cpu_set_t allowed; CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof allowed, &allowed) == 0)
+      for (int i = 0; i < num_cpuids; i++)
+        if (cpuids[i] >= 0 && cpuids[i] < CPU_SETSIZE && CPU_ISSET(cpuids[i], &allowed))
+          return ABT_xstream_set_cpubind(xstream, cpuids[i]);
+#endif
+    return ABT_xstream_set_cpubind(xstream, cpuids[0]); /* none allowed: the error path */
+  }
   return ABT_SUCCESS;
 }
 int ABT_xstream_get_affinity(ABT_xstream xstream, int max_cpuids, int *cpuids, int *num_cpuids) {
