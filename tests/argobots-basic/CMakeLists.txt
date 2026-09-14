@@ -36,12 +36,16 @@ set_target_properties(abttest PROPERTIES C_STANDARD 99)
 # to fix; keep the noise out of the shim's own build log.
 target_compile_options(abttest PRIVATE -w)
 
-# abt_basic_test(<name> [ARGS ...] [EXPECTED_FAIL])
+# abt_basic_test(<name> [ARGS ...] [DIVERGENCE <reason>])
 #   Builds <name>.c from test/basic and registers ctest "argobots_<name>".
-#   EXPECTED_FAIL only adds the ctest label "expected_fail" -- WILL_FAIL is
-#   deliberately NOT set, so the real pass/fail shows up in the ctest summary.
+#   DIVERGENCE labels the test with "divergence" and "<reason>" -- it is
+#   documentation, not behavior: WILL_FAIL is deliberately NOT set, so the real
+#   pass/skip/fail always shows up in the ctest summary.  See RESULTS.md for
+#   the rationale behind each divergence.
+#     ctest -R argobots -LE divergence    # only what the shim promises
+#     ctest -R argobots -L sched_def      # one divergence's tests
 function(abt_basic_test name)
-  cmake_parse_arguments(T "EXPECTED_FAIL" "" "ARGS" ${ARGN})
+  cmake_parse_arguments(T "" "DIVERGENCE" "ARGS" ${ARGN})
   set(_src "${ABT_UPSTREAM_TEST_DIR}/basic/${name}.c")
   if(NOT EXISTS "${_src}")
     message(WARNING "skipping ${name}: ${_src} does not exist")
@@ -63,8 +67,9 @@ function(abt_basic_test name)
                        TIMEOUT 60
                        SKIP_RETURN_CODE 77
                        ENVIRONMENT "ABT_MAX_NUM_XSTREAMS=6")
-  if(T_EXPECTED_FAIL)
-    set_tests_properties(argobots_${name} PROPERTIES LABELS "expected_fail")
+  if(T_DIVERGENCE)
+    set_tests_properties(argobots_${name} PROPERTIES
+                         LABELS "divergence;${T_DIVERGENCE}")
   endif()
 endfunction()
 
@@ -75,37 +80,37 @@ abt_basic_test(xstream_rank           ARGS -e 4)               # getopt
 abt_basic_test(sched_set_main         ARGS -e 4 -u 8)          # getopt
 
 # ----------------------------------------------------------- schedulers ----
-# user-defined ABT_sched_def schedulers are out of scope (PHASE2-PLAN)
-abt_basic_test(xstream_set_main_sched ARGS -e 4 -u 8 EXPECTED_FAIL)
-abt_basic_test(main_sched             ARGS -e 4     EXPECTED_FAIL)
-abt_basic_test(sched_user_ws          ARGS -e 4 -u 8 EXPECTED_FAIL)
+# user-defined ABT_sched_def schedulers are a documented divergence (RESULTS.md)
+abt_basic_test(xstream_set_main_sched ARGS -e 4 -u 8 DIVERGENCE sched_def)
+abt_basic_test(main_sched             ARGS -e 4      DIVERGENCE sched_def)
+abt_basic_test(sched_user_ws          ARGS -e 4 -u 8 DIVERGENCE sched_def)
 abt_basic_test(sched_basic            ARGS 4 8)                # positional
 abt_basic_test(sched_basic_wait       ARGS 4 8)                # positional
 abt_basic_test(sched_randws           ARGS -e 4 -u 8)          # getopt
 abt_basic_test(sched_config)                                   # no args
-abt_basic_test(sched_on_thread        ARGS 4 8)                # positional
-abt_basic_test(sched_prio             ARGS 6 EXPECTED_FAIL)    # positional; tasklets
-abt_basic_test(sched_stack            ARGS 8 EXPECTED_FAIL)    # positional; tasklets
+abt_basic_test(sched_on_thread        ARGS 4 8 DIVERGENCE stackable_sched)  # positional
+abt_basic_test(sched_prio             ARGS 6)                  # positional
+abt_basic_test(sched_stack            ARGS 8 DIVERGENCE stackable_sched)    # positional
 
 # ---------------------------------------------------------------- pools ----
 abt_basic_test(pool_config)                                    # no args
-# ABT_pool_def pools are in scope, but this test also builds an ABT_sched_def
-# scheduler and calls ABT_thread_revive
-abt_basic_test(pool_custom            ARGS -e 4 -u 16 EXPECTED_FAIL)
-abt_basic_test(unit                   ARGS -e 4 -u 16 EXPECTED_FAIL)
+# ABT_pool_def pools are in scope; this test needs the 2.0-style
+# ABT_pool_user_def_create, plus an ABT_sched_def scheduler and ABT_thread_revive
+abt_basic_test(pool_custom            ARGS -e 4 -u 16 DIVERGENCE user_pool)
+abt_basic_test(unit                   ARGS -e 4 -u 16 DIVERGENCE sched_def)
 
 # -------------------------------------------------------------- threads ----
 abt_basic_test(thread_create             ARGS 4 8)             # positional
 abt_basic_test(thread_create2            ARGS 4 8)             # positional
 abt_basic_test(thread_create3            ARGS 4)               # positional
-abt_basic_test(thread_create4            EXPECTED_FAIL)        # ABT_thread_revive
+abt_basic_test(thread_create4            DIVERGENCE revive)    # ABT_thread_revive
 abt_basic_test(thread_create_on_xstream  ARGS 4 8)             # positional
 abt_basic_test(thread_yield              ARGS 4 8)             # positional
-abt_basic_test(thread_yield2             EXPECTED_FAIL)        # tasklets
+abt_basic_test(thread_yield2)                                  # no args; tasklets
 abt_basic_test(thread_yield_to           ARGS 2 4)             # positional
-abt_basic_test(thread_exit               EXPECTED_FAIL)        # ABT_thread_exit
+abt_basic_test(thread_exit)                                    # no args
 abt_basic_test(thread_self_suspend_resume ARGS -e 4 -u 8 -i 10)
-abt_basic_test(thread_get_last_xstream   ARGS 4 8 EXPECTED_FAIL) # tasklets
+abt_basic_test(thread_get_last_xstream   ARGS 4 8)             # positional; tasklets
 abt_basic_test(thread_migrate            ARGS 4 8)             # positional
 abt_basic_test(thread_data               ARGS -e 4 -u 8)       # getopt
 abt_basic_test(thread_data2              ARGS -e 4 -u 8)       # getopt
@@ -119,13 +124,16 @@ abt_basic_test(mutex_spinlock     ARGS -e 4 -u 8 -i 20)
 abt_basic_test(mutex_static       ARGS -e 4 -u 8 -i 20)
 abt_basic_test(mutex_recursive    ARGS -e 4 -u 8)
 abt_basic_test(cond_test          ARGS 4 8)                    # positional
-abt_basic_test(cond_join          ARGS 4 EXPECTED_FAIL)        # ABT_thread_exit
+abt_basic_test(cond_join          ARGS 4)                      # positional (iterations)
 abt_basic_test(cond_static        ARGS -i 20)                  # getopt
-abt_basic_test(cond_timedwait     ARGS -e 4 -u 8 EXPECTED_FAIL) # ABT_thread_exit
+abt_basic_test(cond_timedwait     ARGS -e 4 -u 8)
 abt_basic_test(eventual_create)                                # no args
-abt_basic_test(eventual_test      ARGS -e 4 -u 8 -t 4 -i 20 EXPECTED_FAIL) # tasklets
+abt_basic_test(eventual_test      ARGS -e 4 -u 8 -t 4 -i 20)   # tasklets
 abt_basic_test(eventual_static    ARGS -e 4 -u 8 -i 20)
-abt_basic_test(eventual_timedwait ARGS -e 4 -u 8)
+# one ES on purpose (the upstream default): this test increments a plain
+# volatile counter from every woken waiter, so several ESs lose updates and
+# it fails ~1 run in 2 -- the race is the test's, not the shim's (D6)
+abt_basic_test(eventual_timedwait ARGS -e 1 -u 8)
 abt_basic_test(sync_no_contention)                             # no args
 # "rwlock_test" does not exist upstream; the rwlock tests are these three
 abt_basic_test(rwlock_reader_incl        ARGS 4 4 4 20)        # positional
@@ -133,8 +141,8 @@ abt_basic_test(rwlock_reader_writer_excl ARGS 4 4 4 20)        # positional
 abt_basic_test(rwlock_writer_excl        ARGS 4 4 4 20)        # positional
 
 # ------------------------------------------------------- external threads --
-abt_basic_test(ext_thread          EXPECTED_FAIL)              # tasklets
-abt_basic_test(ext_thread2         EXPECTED_FAIL)              # ABT_thread_exit
+abt_basic_test(ext_thread)                                     # no args; tasklets
+abt_basic_test(ext_thread2         DIVERGENCE exit_to)          # ABT_self_exit / ABT_thread_exit_to
 abt_basic_test(ext_thread_mutex    ARGS -e 4 -u 8 -i 200)
 abt_basic_test(ext_thread_cond     ARGS -i 50)
 abt_basic_test(ext_thread_eventual ARGS -e 4 -u 8 -i 50)
@@ -145,4 +153,4 @@ abt_basic_test(info_query)                                     # no args
 abt_basic_test(error)                                          # no args
 abt_basic_test(timer         ARGS 4 8)                         # positional
 abt_basic_test(self_rank_id)                                   # no args
-abt_basic_test(self_type     EXPECTED_FAIL)                    # tasklets
+abt_basic_test(self_type)                    # tasklets
