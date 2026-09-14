@@ -18,6 +18,29 @@ struct ABTI_pe_msg {
   int cpuid;
 };
 enum { ABTI_OP_LEASE = 1, ABTI_OP_AFFINITY = 2 };
+static void release_handler(void *vm);
+
+struct ABTI_run_msg {
+  char hdr[CmiMsgHeaderSizeBytes];
+  void (*fn)(void *);
+  void *arg;
+  std::atomic<int> *done;
+};
+static void run_handler(void *vm) {
+  ABTI_run_msg *m = (ABTI_run_msg *)vm;
+  m->fn(m->arg);
+  m->done->store(1, std::memory_order_release);
+  CmiFree(m);
+}
+void ABTI_run_on_pe(void (*fn)(void *), void *arg) {
+  std::atomic<int> done{0};
+  ABTI_run_msg *m = (ABTI_run_msg *)CmiAlloc(sizeof(ABTI_run_msg));
+  CmiInitMsgHeader(m, (int)sizeof(ABTI_run_msg));
+  CmiSetHandler(m, ABTI_g->run_handler.load());
+  m->fn = fn; m->arg = arg; m->done = &done;
+  CmiPushPE(ABTI_g->num_pes > 1 ? 1 : 0, m); /* a worker PE: the primary may be busy in user code */
+  while (!done.load(std::memory_order_acquire)) sched_yield();
+}
 
 static void send_pe_msg(int rank, ABTI_xstream *xs, int op, int cpuid, int handler) {
   ABTI_pe_msg *m = (ABTI_pe_msg *)CmiAlloc(sizeof(ABTI_pe_msg));
@@ -45,10 +68,16 @@ static void affinity_handler(void *vm) {
 void ABTI_register_handlers() {
   int l = CmiRegisterHandler((CmiHandler)lease_handler);
   int a = CmiRegisterHandler((CmiHandler)affinity_handler);
+  int r = CmiRegisterHandler((CmiHandler)run_handler);
+  int rl = CmiRegisterHandler((CmiHandler)release_handler);
   int e = -1;
   if (!ABTI_g->lease_handler.compare_exchange_strong(e, l) && e != l) CmiAbort("abt: handler indices differ across PEs\n");
   e = -1;
   if (!ABTI_g->affinity_handler.compare_exchange_strong(e, a) && e != a) CmiAbort("abt: handler indices differ across PEs\n");
+  e = -1;
+  if (!ABTI_g->run_handler.compare_exchange_strong(e, r) && e != r) CmiAbort("abt: handler indices differ across PEs\n");
+  e = -1;
+  if (!ABTI_g->release_handler.compare_exchange_strong(e, rl) && e != rl) CmiAbort("abt: handler indices differ across PEs\n");
 }
 
 static void unlock_mutex(void *m) { static_cast<std::mutex *>(m)->unlock(); }
@@ -65,24 +94,36 @@ static bool pools_drained(ABTI_sched *s) {
   return true;
 }
 
+/* Second half of a lease release, run as a handler on the releasing PE.
+ * It travels through the PE's self queue BEHIND the default-table install,
+ * so by the time it runs the PE has swapped tables: no sweep will touch the
+ * scheduler's pools again, and the joiner may free them. */
+static void release_handler(void *vm) {
+  ABTI_pe_msg *m = (ABTI_pe_msg *)vm;
+  ABTI_xstream *xs = m->xs;
+  CmiFree(m);
+  xs->main_sched->used_by = nullptr;
+  xs->state.store(ABT_XSTREAM_STATE_TERMINATED);
+  std::vector<CthThread> joiners;
+  {
+    std::lock_guard<std::mutex> g(xs->jm);
+    xs->finished.store(1, std::memory_order_release);
+    joiners.swap(xs->joiners);
+  }
+  for (CthThread j : joiners) CthAwakenIfBlocked(j);
+}
+
 /* CcdPROCESSOR_STILL_IDLE on every PE */
 void ABTI_xstream_idle_hook(void *) {
   ABTI_xstream *xs = ABTI_tls_xstream;
   if (!xs) return;
   if (xs->finishing.load(std::memory_order_acquire) && pools_drained(xs->main_sched)) {
-    /* release the lease: default table, park policy, wake joiners */
-    CsdSchedTableInstall(CmiMyRank(), CsdSchedTableCreate(nullptr, 0));
-    CsdSetSleepOnIdle(1);
+    /* release the lease: default table first, then the completion message */
+    int rank = CmiMyRank();
     ABTI_tls_xstream = nullptr;
-    xs->main_sched->used_by = nullptr;
-    xs->state.store(ABT_XSTREAM_STATE_TERMINATED);
-    std::vector<CthThread> joiners;
-    {
-      std::lock_guard<std::mutex> g(xs->jm);
-      xs->finished.store(1, std::memory_order_release);
-      joiners.swap(xs->joiners);
-    }
-    for (CthThread j : joiners) CthAwakenIfBlocked(j);
+    CsdSetSleepOnIdle(1);
+    CsdSchedTableInstall(rank, CsdSchedTableCreate(nullptr, 0));
+    send_pe_msg(rank, xs, 0, -1, ABTI_g->release_handler.load());
     return;
   }
   if (xs->main_sched->predef == ABT_SCHED_BASIC_WAIT && !xs->main_sched->pools.empty()) {

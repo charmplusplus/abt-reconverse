@@ -8,6 +8,7 @@
 #include "abti.h"
 #include <cstring>
 #include <sched.h>
+#include <pthread.h>
 
 #if defined(__clang__) || defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wunused-parameter"
@@ -93,7 +94,11 @@ struct ABTI_mutex {
 static_assert(sizeof(ABTI_mutex) <= sizeof(ABT_mutex_memory), "mutex layout");
 struct ABTI_mutex_attr { int recursive; };
 static inline ABTI_mutex *M(ABT_mutex h) { return ABTI_obj<ABTI_mutex>(h); }
-static inline uint64_t self_id(ABTI_thread *self) { return self ? self->id : (uint64_t)-1; }
+/* ULTs use their ABT id; an external pthread its pthread_self with the top
+ * bit set, so recursive locking works for it too */
+static inline uint64_t self_id(ABTI_thread *self) {
+  return self ? self->id : (((uint64_t)(uintptr_t)pthread_self()) | (1ULL << 63));
+}
 
 static int mutex_lock(ABTI_mutex *m, bool spin_only) {
   ABTI_thread *self = ABTI_self_thread();
@@ -104,7 +109,7 @@ static int mutex_lock(ABTI_mutex *m, bool spin_only) {
       m->locked.store(1, std::memory_order_relaxed); m->owner = me; m->nesting = 0;
       spin_release(m->slock); return ABT_SUCCESS;
     }
-    if ((m->attrs & 1) && m->owner == me && me != (uint64_t)-1) { m->nesting++; spin_release(m->slock); return ABT_SUCCESS; }
+    if ((m->attrs & 1) && m->owner == me) { m->nesting++; spin_release(m->slock); return ABT_SUCCESS; }
     if (spin_only) { spin_release(m->slock); sched_yield(); continue; }
     ABTI_waiter w{self ? self->cth : nullptr, {0}, nullptr};
     wl_push(m->wl, &w);
@@ -138,7 +143,7 @@ int ABT_mutex_trylock(ABT_mutex mutex) {
   uint64_t me = self_id(ABTI_self_thread());
   spin_acquire(m->slock);
   if (!m->locked.load(std::memory_order_relaxed)) { m->locked.store(1); m->owner = me; m->nesting = 0; spin_release(m->slock); return ABT_SUCCESS; }
-  if ((m->attrs & 1) && m->owner == me && me != (uint64_t)-1) { m->nesting++; spin_release(m->slock); return ABT_SUCCESS; }
+  if ((m->attrs & 1) && m->owner == me) { m->nesting++; spin_release(m->slock); return ABT_SUCCESS; }
   spin_release(m->slock); return ABT_ERR_MUTEX_LOCKED;
 }
 int ABT_mutex_unlock(ABT_mutex mutex) {

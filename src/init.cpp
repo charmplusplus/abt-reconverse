@@ -58,7 +58,8 @@ int ABTI_num_pes_rule() {
   long cores = sysconf(_SC_NPROCESSORS_ONLN);
   if (cores < 1) cores = 1;
   long maxx = env_long("ABT_MAX_NUM_XSTREAMS", 0);
-  long n = maxx > 0 ? maxx + 1 : (cores * 2 < 16 ? 16 : cores * 2);
+  long floor_n = cores * 2 < 16 ? 16 : cores * 2;
+  long n = maxx > 0 ? (maxx + 1 > floor_n ? maxx + 1 : floor_n) : floor_n; /* the PE count is fixed at the first init */
   if (n < 2) n = 2;
   if (n > 128) n = 128;
   return (int)n;

@@ -140,6 +140,8 @@ struct ABTI_global {
    * the others verify -- workers register before rank 0 does) */
   std::atomic<int> lease_handler{-1};
   std::atomic<int> affinity_handler{-1};
+  std::atomic<int> run_handler{-1};
+  std::atomic<int> release_handler{-1};
 };
 extern ABTI_global *ABTI_g;
 extern thread_local ABTI_xstream *ABTI_tls_xstream; /* per PE */
@@ -199,6 +201,9 @@ CsdSchedTable ABTI_sched_build_table(ABTI_sched *s);
 
 /* xstream.cpp */
 int ABTI_xstream_lease(ABTI_sched *sched, int want_rank, ABTI_xstream **out);
+/* run fn(arg) on a PE (rank 1 if it exists) and wait for it; for callers
+ * that are not PE threads and need per-PE runtime state (CthCreate) */
+void ABTI_run_on_pe(void (*fn)(void *), void *arg);
 void ABTI_xstream_idle_hook(void *);                    /* CcdCondFn, registered per PE */
 void ABTI_register_handlers();                          /* same order on every PE */
 void ABTI_xstream_install(ABTI_xstream *xs);            /* table + lease message */

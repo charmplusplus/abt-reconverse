@@ -115,11 +115,20 @@ static ABT_thread_state map_state(ABTI_thread *t) {
 
 extern "C" {
 
+struct create_req { ABT_pool pool; void (*fn)(void *); void *arg; ABT_thread_attr attr; ABT_thread *out; int ret; };
+static void create_on_pe(void *a) { create_req *r = (create_req *)a; r->ret = ABT_thread_create(r->pool, r->fn, r->arg, r->attr, r->out); }
+
 int ABT_thread_create(ABT_pool pool, void (*thread_func)(void *), void *arg, ABT_thread_attr attr, ABT_thread *newthread) {
   ABTI_CHECK_INITIALIZED();
   ABTI_pool *p = ABTI_pool_get(pool);
   ABTI_CHECK_NULL(p, ABT_ERR_INV_POOL);
-  if (!ABTI_on_pe()) return ABT_ERR_INV_XSTREAM; /* stacks and tokens are PE-owned */
+  if (!ABTI_on_pe()) {
+    /* stacks and tokens are PE-owned: create on a PE and wait (Mercury
+     * callbacks and Mochi clients do create ULTs from plain pthreads) */
+    create_req r{pool, thread_func, arg, attr, newthread, ABT_SUCCESS};
+    ABTI_run_on_pe(create_on_pe, &r);
+    return r.ret;
+  }
   ABTI_thread *t = new ABTI_thread();
   t->type = newthread ? ABTI_THREAD_NAMED : ABTI_THREAD_DETACHED;
   t->fn = thread_func; t->arg = arg;
@@ -388,6 +397,7 @@ int ABT_self_get_thread_id(ABT_unit_id *id) { return ABT_thread_self_id(id); }
 int ABT_self_set_specific(ABT_key key, void *value) { return ABT_key_set(key, value); }
 int ABT_self_get_specific(ABT_key key, void **value) { return ABT_key_get(key, value); }
 int ABT_self_get_type(ABT_unit_type *type) {
+  if (type) *type = ABT_UNIT_TYPE_EXT;
   ABTI_CHECK_INITIALIZED();
   *type = ABTI_self_thread() ? ABT_UNIT_TYPE_THREAD : ABT_UNIT_TYPE_EXT; return ABT_SUCCESS;
 }
@@ -460,7 +470,11 @@ int ABT_task_revive(ABT_pool pool, void (*task_func)(void *), void *arg, ABT_tas
 int ABT_task_free(ABT_task *task) { ABTI_UNIMPLEMENTED("ABT_task_free"); }
 int ABT_task_join(ABT_task task) { ABTI_UNIMPLEMENTED("ABT_task_join"); }
 int ABT_task_cancel(ABT_task task) { ABTI_UNIMPLEMENTED("ABT_task_cancel"); }
-int ABT_task_self(ABT_task *task) { ABTI_UNIMPLEMENTED("ABT_task_self"); }
+int ABT_task_self(ABT_task *task) {
+  if (task) *task = ABT_TASK_NULL;
+  ABTI_CHECK_INITIALIZED();
+  ABTI_UNIMPLEMENTED("ABT_task_self");
+}
 int ABT_task_self_id(ABT_unit_id *id) { ABTI_UNIMPLEMENTED("ABT_task_self_id"); }
 int ABT_task_get_xstream(ABT_task task, ABT_xstream *xstream) { ABTI_UNIMPLEMENTED("ABT_task_get_xstream"); }
 int ABT_task_get_state(ABT_task task, ABT_task_state *state) { ABTI_UNIMPLEMENTED("ABT_task_get_state"); }
