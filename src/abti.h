@@ -150,6 +150,8 @@ struct ABTI_global {
   size_t default_stacksize;
   std::mutex xm;
   std::vector<ABTI_xstream *> xstreams; /* indexed by rank; NULL = free */
+  std::vector<pthread_t> pe_threads;    /* the PE pthreads, recorded by per_pe_setup on each PE */
+  std::vector<char> pe_thread_known;
   ABTI_xstream *primary_xstream;
   ABTI_thread *primary_thread;
   std::atomic<uint64_t> next_id{1};

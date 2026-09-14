@@ -1,5 +1,6 @@
 /* ABT_init / ABT_finalize / ABT_initialized and the unimplemented-call
  * bookkeeping shared by every module. */
+#include <pthread.h>
 #include "abti.h"
 #include <cstdlib>
 #include <cstring>
@@ -41,6 +42,7 @@ static long env_long(const char *name, long dflt) {
  * rank 0 after ConverseInit returns */
 static void per_pe_setup() {
   ABTI_register_handlers();
+  { int r = CmiMyRank(); ABTI_g->pe_threads[r] = pthread_self(); ABTI_g->pe_thread_known[r] = 1; }
   CcdCallOnConditionKeep(CcdPROCESSOR_STILL_IDLE, ABTI_xstream_idle_hook, nullptr);
 }
 
@@ -120,6 +122,8 @@ int ABT_init(int argc, char **argv) {
     G->default_stacksize = (size_t)env_long("ABT_THREAD_STACKSIZE", 2 * 1024 * 1024);
     if (G->default_stacksize < 16384) G->default_stacksize = 16384;
     G->xstreams.assign(G->num_pes, nullptr);
+    G->pe_threads.assign(G->num_pes, pthread_t());
+    G->pe_thread_known.assign(G->num_pes, 0);
     ABTI_g = G;
     start_runtime(G->num_pes);
   }

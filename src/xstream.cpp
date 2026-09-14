@@ -385,6 +385,13 @@ int ABT_xstream_check_events(ABT_sched sched) {
 int ABT_xstream_set_cpubind(ABT_xstream xstream, int cpuid) {
   ABTI_xstream *x = ABTI_xstream_get(xstream); ABTI_CHECK_NULL(x, ABT_ERR_INV_XSTREAM);
   if (ABTI_AFFINITY_NA) return ABT_ERR_FEATURE_NA;
+#if !ABTI_AFFINITY_NA
+  { /* the bind itself runs later on the PE; reject now what it would reject */
+    cpu_set_t allowed; CPU_ZERO(&allowed);
+    if (cpuid < 0 || cpuid >= CPU_SETSIZE || sched_getaffinity(0, sizeof allowed, &allowed) != 0 || !CPU_ISSET(cpuid, &allowed))
+      return ABT_ERR_OTHER;
+  }
+#endif
   x->cpubind = cpuid;
   send_pe_msg(x->rank, x, ABTI_OP_AFFINITY, cpuid, ABTI_g->affinity_handler);
   return ABT_SUCCESS;
@@ -398,6 +405,7 @@ static int ABTI_xstream_os_affinity(ABTI_xstream *x, std::vector<int> &out) {
 #else
   pthread_t t;
   if (x->thread_known.load(std::memory_order_acquire)) t = x->thread;
+  else if (x->rank >= 0 && x->rank < ABTI_g->num_pes && ABTI_g->pe_thread_known[x->rank]) t = ABTI_g->pe_threads[x->rank]; /* xstream created, lease not yet run */
   else if (ABTI_on_pe() && CmiMyRank() == x->rank) t = pthread_self();
   else return ABT_ERR_FEATURE_NA;
   cpu_set_t set; CPU_ZERO(&set);

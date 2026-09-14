@@ -32,8 +32,8 @@ sort -u -o "${TMP}/decl" "${TMP}/decl"
 
 # Exported symbols (Mach-O underscore prefix stripped if present).
 nm -g "${LIB}" 2>/dev/null \
-  | grep -E ' [TDSB] _?ABT_' \
-  | sed -e 's/.* [TDSB] //' -e 's/^_//' \
+  | grep -E ' [TDSBR] _?ABT_' \
+  | sed -e 's/.* [TDSBR] //' -e 's/^_//' \
   | sort -u > "${TMP}/sym"
 
 missing=$(comm -23 "${TMP}/decl" "${TMP}/sym")

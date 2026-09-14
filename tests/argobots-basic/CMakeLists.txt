@@ -14,10 +14,6 @@
 # ABT_MAX_NUM_XSTREAMS=6 is set for every test (xstreams used + 1).  Most tests
 # then override it: ATS_init() putenv()s the number of xstreams it was given.
 
-set(ABT_UPSTREAM_TEST_DIR
-    "/Users/kale/software/argobots-succession/mochi/argobots/test"
-    CACHE PATH "Argobots source checkout's test/ directory")
-
 foreach(_needed util/abttest.c util/abttest.h basic/init_finalize.c)
   if(NOT EXISTS "${ABT_UPSTREAM_TEST_DIR}/${_needed}")
     message(FATAL_ERROR
@@ -31,6 +27,9 @@ target_include_directories(abttest PUBLIC
                            "${ABT_UPSTREAM_TEST_DIR}/util"
                            "${CMAKE_SOURCE_DIR}/include")
 target_link_libraries(abttest PUBLIC abt_static)
+if(NOT APPLE)
+  target_link_libraries(abttest PUBLIC rt) # timer_create in abttest.c (glibc)
+endif()
 set_target_properties(abttest PROPERTIES C_STANDARD 99)
 # Upstream test code is not warning-clean under this compiler and is not ours
 # to fix; keep the noise out of the shim's own build log.

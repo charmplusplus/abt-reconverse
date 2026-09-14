@@ -61,7 +61,15 @@ set_tests_properties(daos_mock PROPERTIES TIMEOUT 180)
 # the shim.  They are a conformance measurement, not a gate: many fail while
 # the shim is incomplete, so they are all named argobots_* and can be run on
 # their own with `ctest -R argobots`.
-option(ABT_BUILD_ARGOBOTS_TESTS "Build the upstream Argobots test/basic suite against the shim" ON)
+set(ABT_UPSTREAM_TEST_DIR "${CMAKE_SOURCE_DIR}/../mochi/argobots/test"
+    CACHE PATH "Argobots source checkout's test/ directory (upstream test/basic suite)")
+if(EXISTS "${ABT_UPSTREAM_TEST_DIR}/util/abttest.c")
+  set(_abt_tests_default ON)
+else()
+  set(_abt_tests_default OFF)
+  message(STATUS "Argobots upstream tests not built: ${ABT_UPSTREAM_TEST_DIR} has no util/abttest.c (set -DABT_UPSTREAM_TEST_DIR)")
+endif()
+option(ABT_BUILD_ARGOBOTS_TESTS "Build the upstream Argobots test/basic suite against the shim" ${_abt_tests_default})
 if(ABT_BUILD_ARGOBOTS_TESTS)
   add_subdirectory(argobots-basic)
 endif()
