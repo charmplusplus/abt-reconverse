@@ -79,6 +79,7 @@ ABTI_thread *ABTI_thread_wrap_primary(CthThread cth, ABTI_pool *pool) {
   t->pool = nullptr; t->unit = ABT_UNIT_NULL;
   t->last_xstream = nullptr; t->migrate_to = nullptr;
   t->freed_by_exit = false;
+  t->is_task = false;
   ABTI_pool_associate(t, pool);
   CthSetUserData(cth, t);
   CthSetAwakenFn(cth, ABTI_thread_awaken_fn, t); /* pinned to PE 0 by reconverse */
@@ -141,6 +142,7 @@ int ABT_thread_create(ABT_pool pool, void (*thread_func)(void *), void *arg, ABT
   t->pool = nullptr; t->unit = ABT_UNIT_NULL;
   t->last_xstream = nullptr; t->migrate_to = nullptr;
   t->freed_by_exit = t->type == ABTI_THREAD_DETACHED;
+  t->is_task = false;
   t->cth = CthCreate(thread_main, t, (int)stacksize);
   CthSetUserData(t->cth, t);
   CthSetAwakenFn(t->cth, ABTI_thread_awaken_fn, t);
@@ -206,11 +208,11 @@ int ABT_thread_self(ABT_thread *thread) {
   ABTI_CHECK_INITIALIZED();
   if (!ABTI_on_pe()) return ABT_ERR_INV_XSTREAM;
   ABTI_thread *t = ABTI_self_thread();
-  if (!t) { *thread = ABT_THREAD_NULL; return ABT_ERR_INV_THREAD; }
+  if (!t || t->is_task) return ABT_ERR_INV_THREAD; /* a tasklet is not a ULT */
   *thread = ABTI_thread_handle(t); return ABT_SUCCESS;
 }
 int ABT_thread_self_id(ABT_unit_id *id) {
-  ABTI_thread *t = ABTI_self_thread(); if (!t) return ABTI_on_pe() ? ABT_ERR_INV_THREAD : ABT_ERR_INV_XSTREAM;
+  ABTI_thread *t = ABTI_self_thread(); if (!t || t->is_task) return ABTI_on_pe() ? ABT_ERR_INV_THREAD : ABT_ERR_INV_XSTREAM;
   *id = t->id; return ABT_SUCCESS;
 }
 int ABT_thread_get_id(ABT_thread thread, ABT_unit_id *thread_id) {
@@ -405,7 +407,8 @@ int ABT_self_get_type(ABT_unit_type *type) {
   if (type) *type = ABT_UNIT_TYPE_EXT;
   ABTI_CHECK_INITIALIZED();
   if (!ABTI_on_pe()) return ABT_ERR_INV_XSTREAM; /* 1.x: external thread reports EXT with this error */
-  *type = ABTI_self_thread() ? ABT_UNIT_TYPE_THREAD : ABT_UNIT_TYPE_EXT; return ABT_SUCCESS;
+  ABTI_thread *st = ABTI_self_thread();
+  *type = st ? (st->is_task ? ABT_UNIT_TYPE_TASK : ABT_UNIT_TYPE_THREAD) : ABT_UNIT_TYPE_EXT; return ABT_SUCCESS;
 }
 int ABT_self_is_primary(ABT_bool *is_primary) {
   if (is_primary) *is_primary = ABT_FALSE;
@@ -480,27 +483,94 @@ int ABT_self_exit(void) { return ABT_thread_exit(); }
 int ABT_self_exit_to(ABT_thread thread) { ABTI_UNIMPLEMENTED("ABT_self_exit_to"); }
 int ABT_self_resume_exit_to(ABT_thread thread) { ABTI_UNIMPLEMENTED("ABT_self_resume_exit_to"); }
 int ABT_self_schedule(ABT_thread thread, ABT_pool pool) { ABTI_UNIMPLEMENTED("ABT_self_schedule"); }
-int ABT_task_create(ABT_pool pool, void (*task_func)(void *), void *arg, ABT_task *newtask) { ABTI_UNIMPLEMENTED("ABT_task_create"); }
-int ABT_task_create_on_xstream(ABT_xstream xstream, void (*task_func)(void *), void *arg, ABT_task *newtask) { ABTI_UNIMPLEMENTED("ABT_task_create_on_xstream"); }
+/* ---- tasklets: run as ULTs with a small stack. Argobots' tasklets cannot
+ * yield or block; ours technically can, which only makes them more
+ * permissive. Handles are ABT_thread handles (same opaque type). ---- */
+static int task_create_impl(ABT_pool pool, void (*fn)(void *), void *arg, ABT_task *newtask) {
+  ABT_thread th;
+  ABT_thread_attr attr; ABT_thread_attr_create(&attr);
+  ABT_thread_attr_set_stacksize(attr, 64 * 1024);
+  int r = ABT_thread_create(pool, fn, arg, attr, newtask ? &th : nullptr);
+  ABT_thread_attr_free(&attr);
+  if (r != ABT_SUCCESS) return r;
+  if (newtask) { ABTI_thread_get(th)->is_task = true; *newtask = th; }
+  return ABT_SUCCESS;
+}
+static inline ABTI_thread *task_get(ABT_task h) { ABTI_thread *t = ABTI_thread_get(h); return (t && t->is_task) ? t : nullptr; }
+
+int ABT_task_create(ABT_pool pool, void (*task_func)(void *), void *arg, ABT_task *newtask) {
+  return task_create_impl(pool, task_func, arg, newtask);
+}
+int ABT_task_create_on_xstream(ABT_xstream xstream, void (*task_func)(void *), void *arg, ABT_task *newtask) {
+  ABTI_xstream *x = ABTI_xstream_get(xstream); ABTI_CHECK_NULL(x, ABT_ERR_INV_XSTREAM);
+  if (!x->main_sched || x->main_sched->pools.empty()) return ABT_ERR_INV_XSTREAM;
+  return task_create_impl(ABTI_pool_handle(x->main_sched->pools[0]), task_func, arg, newtask);
+}
 int ABT_task_revive(ABT_pool pool, void (*task_func)(void *), void *arg, ABT_task *task) { ABTI_UNIMPLEMENTED("ABT_task_revive"); }
-int ABT_task_free(ABT_task *task) { ABTI_UNIMPLEMENTED("ABT_task_free"); }
-int ABT_task_join(ABT_task task) { ABTI_UNIMPLEMENTED("ABT_task_join"); }
+int ABT_task_free(ABT_task *task) {
+  ABTI_CHECK_NULL(task, ABT_ERR_INV_TASK);
+  ABTI_thread *t = task_get(*task); ABTI_CHECK_NULL(t, ABT_ERR_INV_TASK);
+  int r = ABT_thread_free(task); return r;
+}
+int ABT_task_join(ABT_task task) {
+  ABTI_thread *t = task_get(task); ABTI_CHECK_NULL(t, ABT_ERR_INV_TASK);
+  return ABT_thread_join(task);
+}
 int ABT_task_cancel(ABT_task task) { ABTI_UNIMPLEMENTED("ABT_task_cancel"); }
 int ABT_task_self(ABT_task *task) {
   if (task) *task = ABT_TASK_NULL;
   ABTI_CHECK_INITIALIZED();
   if (!ABTI_on_pe()) return ABT_ERR_INV_XSTREAM;
-  return ABT_ERR_INV_TASK; /* there are no tasklets: a ULT or external caller is never a task */
+  ABTI_thread *t = ABTI_self_thread();
+  if (!t || !t->is_task) return ABT_ERR_INV_TASK; /* a ULT or external caller is not a task */
+  *task = ABTI_thread_handle(t); return ABT_SUCCESS;
 }
-int ABT_task_self_id(ABT_unit_id *id) { ABTI_UNIMPLEMENTED("ABT_task_self_id"); }
-int ABT_task_get_xstream(ABT_task task, ABT_xstream *xstream) { ABTI_UNIMPLEMENTED("ABT_task_get_xstream"); }
-int ABT_task_get_state(ABT_task task, ABT_task_state *state) { ABTI_UNIMPLEMENTED("ABT_task_get_state"); }
-int ABT_task_get_last_pool(ABT_task task, ABT_pool *pool) { ABTI_UNIMPLEMENTED("ABT_task_get_last_pool"); }
-int ABT_task_get_last_pool_id(ABT_task task, int *id) { ABTI_UNIMPLEMENTED("ABT_task_get_last_pool_id"); }
-int ABT_task_set_migratable(ABT_task task, ABT_bool flag) { ABTI_UNIMPLEMENTED("ABT_task_set_migratable"); }
-int ABT_task_is_migratable(ABT_task task, ABT_bool *flag) { ABTI_UNIMPLEMENTED("ABT_task_is_migratable"); }
-int ABT_task_equal(ABT_task task1, ABT_task task2, ABT_bool *result) { ABTI_UNIMPLEMENTED("ABT_task_equal"); }
-int ABT_task_get_id(ABT_task task, ABT_unit_id *task_id) { ABTI_UNIMPLEMENTED("ABT_task_get_id"); }
-int ABT_task_get_arg(ABT_task task, void **arg) { ABTI_UNIMPLEMENTED("ABT_task_get_arg"); }
+int ABT_task_self_id(ABT_unit_id *id) {
+  ABTI_CHECK_INITIALIZED();
+  if (!ABTI_on_pe()) return ABT_ERR_INV_XSTREAM;
+  ABTI_thread *t = ABTI_self_thread();
+  if (!t || !t->is_task) return ABT_ERR_INV_TASK;
+  *id = t->id; return ABT_SUCCESS;
+}
+int ABT_task_get_xstream(ABT_task task, ABT_xstream *xstream) {
+  ABTI_thread *t = task_get(task); ABTI_CHECK_NULL(t, ABT_ERR_INV_TASK);
+  *xstream = ABTI_xstream_handle(t->last_xstream); return ABT_SUCCESS;
+}
+int ABT_task_get_state(ABT_task task, ABT_task_state *state) {
+  ABTI_thread *t = task_get(task); ABTI_CHECK_NULL(t, ABT_ERR_INV_TASK);
+  ABT_thread_state s; ABT_thread_get_state(task, &s);
+  switch (s) {
+  case ABT_THREAD_STATE_READY: *state = ABT_TASK_STATE_READY; break;
+  case ABT_THREAD_STATE_RUNNING: *state = ABT_TASK_STATE_RUNNING; break;
+  case ABT_THREAD_STATE_TERMINATED: *state = ABT_TASK_STATE_TERMINATED; break;
+  default: *state = ABT_TASK_STATE_RUNNING; break; /* tasklets have no BLOCKED */
+  }
+  return ABT_SUCCESS;
+}
+int ABT_task_get_last_pool(ABT_task task, ABT_pool *pool) {
+  ABTI_thread *t = task_get(task); ABTI_CHECK_NULL(t, ABT_ERR_INV_TASK);
+  *pool = ABTI_pool_handle(t->pool); return ABT_SUCCESS;
+}
+int ABT_task_get_last_pool_id(ABT_task task, int *id) {
+  ABTI_thread *t = task_get(task); ABTI_CHECK_NULL(t, ABT_ERR_INV_TASK);
+  *id = t->pool ? (int)t->pool->id : -1; return ABT_SUCCESS;
+}
+int ABT_task_set_migratable(ABT_task task, ABT_bool flag) {
+  ABTI_thread *t = task_get(task); ABTI_CHECK_NULL(t, ABT_ERR_INV_TASK);
+  t->attr.migratable = flag; return ABT_SUCCESS;
+}
+int ABT_task_is_migratable(ABT_task task, ABT_bool *flag) {
+  ABTI_thread *t = task_get(task); ABTI_CHECK_NULL(t, ABT_ERR_INV_TASK);
+  *flag = t->attr.migratable; return ABT_SUCCESS;
+}
+int ABT_task_equal(ABT_task task1, ABT_task task2, ABT_bool *result) { *result = task1 == task2 ? ABT_TRUE : ABT_FALSE; return ABT_SUCCESS; }
+int ABT_task_get_id(ABT_task task, ABT_unit_id *task_id) {
+  ABTI_thread *t = task_get(task); ABTI_CHECK_NULL(t, ABT_ERR_INV_TASK);
+  *task_id = t->id; return ABT_SUCCESS;
+}
+int ABT_task_get_arg(ABT_task task, void **arg) {
+  ABTI_thread *t = task_get(task); ABTI_CHECK_NULL(t, ABT_ERR_INV_TASK);
+  *arg = t->arg; return ABT_SUCCESS;
+}
 
 } /* extern "C" */
