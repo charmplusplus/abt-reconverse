@@ -143,11 +143,7 @@ unsigned int abti_max_xstreams(void)
 {
     if (ABTI_g)
         return (unsigned int)ABTI_g->num_pes;
-    long cores = sysconf(_SC_NPROCESSORS_ONLN);
-    if (cores < 1)
-        cores = 1;
-    long n = abti_env_long("ABT_MAX_NUM_XSTREAMS", cores);
-    return (unsigned int)(n < 1 ? 1 : n);
+    return (unsigned int)ABTI_num_pes_rule();
 }
 size_t abti_default_stacksize(void)
 {
@@ -464,10 +460,14 @@ int ABT_info_query_config(ABT_info_query_kind query_kind, void *val)
         *(ABT_bool *)val = ABT_TRUE;
         break;
     case ABT_INFO_QUERY_KIND_ENABLED_AFFINITY:
+#ifdef __APPLE__
+        *(ABT_bool *)val = ABT_FALSE; /* no thread binding on macOS, as native Argobots reports */
+#else
         *(ABT_bool *)val =
             (getenv("ABT_SET_AFFINITY") && atoi(getenv("ABT_SET_AFFINITY")) == 0)
                 ? ABT_FALSE
                 : ABT_TRUE;
+#endif
         break;
     case ABT_INFO_QUERY_KIND_MAX_NUM_XSTREAMS:
         *(unsigned int *)val = abti_max_xstreams();

@@ -190,8 +190,9 @@ int ABT_thread_resume(ABT_thread thread) {
 }
 
 int ABT_thread_self(ABT_thread *thread) {
+  if (thread) *thread = ABT_THREAD_NULL; /* written even on failure (Argobots does) */
   ABTI_CHECK_INITIALIZED();
-  if (!ABTI_on_pe()) { *thread = ABT_THREAD_NULL; return ABT_ERR_INV_XSTREAM; }
+  if (!ABTI_on_pe()) return ABT_ERR_INV_XSTREAM;
   ABTI_thread *t = ABTI_self_thread();
   if (!t) { *thread = ABT_THREAD_NULL; return ABT_ERR_INV_THREAD; }
   *thread = ABTI_thread_handle(t); return ABT_SUCCESS;
@@ -245,7 +246,20 @@ int ABT_thread_migrate_to_sched(ABT_thread thread, ABT_sched sched) {
   if (s->pools.empty()) return ABT_ERR_INV_SCHED;
   return ABT_thread_migrate_to_pool(thread, ABTI_pool_handle(s->pools[0]));
 }
-int ABT_thread_migrate(ABT_thread thread) { ABTI_UNIMPLEMENTED("ABT_thread_migrate"); }
+int ABT_thread_migrate(ABT_thread thread) {
+  /* to some other xstream's main pool, as Argobots does */
+  ABTI_thread *t = ABTI_thread_get(thread); ABTI_CHECK_NULL(t, ABT_ERR_INV_THREAD);
+  int avoid = t->last_xstream ? t->last_xstream->rank : (ABTI_tls_xstream ? ABTI_tls_xstream->rank : -1);
+  ABTI_pool *target = nullptr;
+  {
+    std::lock_guard<std::mutex> g(ABTI_g->xm);
+    for (ABTI_xstream *x : ABTI_g->xstreams)
+      if (x && x->rank != avoid && x->main_sched && !x->main_sched->pools.empty()) { target = x->main_sched->pools[0]; break; }
+  }
+  if (!target) return ABT_ERR_MIGRATION_TARGET;
+  t->migrate_to = target;
+  return ABT_SUCCESS;
+}
 int ABT_thread_set_callback(ABT_thread thread, void (*cb_func)(ABT_thread, void *), void *cb_arg) { return ABT_SUCCESS; /* migration callbacks: never invoked */ }
 int ABT_thread_set_migratable(ABT_thread thread, ABT_bool migratable) {
   ABTI_thread *t = ABTI_thread_get(thread); ABTI_CHECK_NULL(t, ABT_ERR_INV_THREAD);
@@ -294,12 +308,14 @@ int ABT_thread_get_attr(ABT_thread thread, ABT_thread_attr *attr) {
 int ABT_thread_set_specific(ABT_thread thread, ABT_key key, void *value) {
   ABTI_thread *t = ABTI_thread_get(thread); ABTI_CHECK_NULL(t, ABT_ERR_INV_THREAD);
   ABTI_key *k = ABTI_key_get(key); ABTI_CHECK_NULL(k, ABT_ERR_INV_KEY);
+  std::lock_guard<std::mutex> g(t->jm); /* another ULT may set a running thread's key */
   if ((size_t)k->id >= t->keys.size()) t->keys.resize(k->id + 1, nullptr);
   t->keys[k->id] = value; return ABT_SUCCESS;
 }
 int ABT_thread_get_specific(ABT_thread thread, ABT_key key, void **value) {
   ABTI_thread *t = ABTI_thread_get(thread); ABTI_CHECK_NULL(t, ABT_ERR_INV_THREAD);
   ABTI_key *k = ABTI_key_get(key); ABTI_CHECK_NULL(k, ABT_ERR_INV_KEY);
+  std::lock_guard<std::mutex> g(t->jm);
   *value = (size_t)k->id < t->keys.size() ? t->keys[k->id] : nullptr; return ABT_SUCCESS;
 }
 int ABT_key_create(void (*destructor)(void *value), ABT_key *newkey) {
@@ -357,6 +373,7 @@ int ABT_thread_attr_set_migratable(ABT_thread_attr attr, ABT_bool is_migratable)
 
 /* self */
 int ABT_self_get_xstream(ABT_xstream *xstream) {
+  if (xstream) *xstream = ABT_XSTREAM_NULL;
   ABTI_CHECK_INITIALIZED();
   if (!ABTI_on_pe() || !ABTI_tls_xstream) return ABT_ERR_INV_XSTREAM;
   *xstream = ABTI_xstream_handle(ABTI_tls_xstream); return ABT_SUCCESS;

@@ -53,9 +53,15 @@ void ABTI_register_handlers() {
 
 static void unlock_mutex(void *m) { static_cast<std::mutex *>(m)->unlock(); }
 
+/* Argobots' rule (ABTI_sched_has_unit): blocked ULTs keep an xstream alive
+ * only for pools this scheduler owns alone; a pool shared with other
+ * schedulers may hold blocked ULTs that belong to them (the joiner itself,
+ * typically), so only queued work counts there. */
 static bool pools_drained(ABTI_sched *s) {
-  for (ABTI_pool *p : s->pools)
-    if (p->size() != 0 || p->num_blocked.load(std::memory_order_acquire) != 0) return false;
+  for (ABTI_pool *p : s->pools) {
+    if (p->size() != 0) return false;
+    if (p->num_scheds.load() <= 1 && p->num_blocked.load(std::memory_order_acquire) != 0) return false;
+  }
   return true;
 }
 
@@ -80,8 +86,22 @@ void ABTI_xstream_idle_hook(void *) {
     return;
   }
   if (xs->main_sched->predef == ABT_SCHED_BASIC_WAIT && !xs->main_sched->pools.empty()) {
-    /* Argobots' basic_wait blocks on pools[0] when nothing is runnable */
-    ABTI_thread *t = xs->main_sched->pools[0]->pop_timedwait(CmiWallTimer() + 0.010);
+    /* Argobots' basic_wait blocks on pools[0] when nothing is runnable. A
+     * user pool with its own timed pop blocks inside it (short deadline so
+     * runtime messages to this PE are not delayed); a built-in pool parks
+     * the PE in CsdIdleWait, which a push to the pool (sleeper list) or to
+     * any of the PE's own queues ends. */
+    ABTI_pool *p0 = xs->main_sched->pools[0];
+    ABTI_thread *t;
+    if (p0->user && p0->def.p_pop_timedwait) {
+      t = p0->pop_timedwait(CmiWallTimer() + 0.002);
+    } else {
+      int rank = CmiMyRank();
+      p0->add_sleeper(rank);
+      t = p0->pop();
+      if (!t) { CsdIdleWait(0.010); t = p0->pop(); }
+      p0->remove_sleeper(rank);
+    }
     if (t) { CsdReleaseIdle(); ABTI_pool_run_thread(t); }
   }
 }
@@ -186,7 +206,11 @@ int ABT_xstream_free(ABT_xstream *xstream) {
   *xstream = ABT_XSTREAM_NULL;
   return ABT_SUCCESS;
 }
-int ABT_xstream_self(ABT_xstream *xstream) { return ABT_self_get_xstream(xstream); }
+int ABT_xstream_self(ABT_xstream *xstream) {
+  if (xstream) *xstream = ABT_XSTREAM_NULL; /* written even on failure (Argobots does) */
+  ABTI_CHECK_INITIALIZED();
+  return ABT_self_get_xstream(xstream);
+}
 int ABT_xstream_self_rank(int *rank) { return ABT_self_get_xstream_rank(rank); }
 int ABT_xstream_get_rank(ABT_xstream xstream, int *rank) {
   ABTI_xstream *x = ABTI_xstream_get(xstream); ABTI_CHECK_NULL(x, ABT_ERR_INV_XSTREAM);
@@ -247,26 +271,33 @@ int ABT_xstream_is_primary(ABT_xstream xstream, ABT_bool *is_primary) {
   *is_primary = x->primary ? ABT_TRUE : ABT_FALSE; return ABT_SUCCESS;
 }
 int ABT_xstream_check_events(ABT_sched sched) { return ABT_SUCCESS; }
+#ifdef __APPLE__
+#define ABTI_AFFINITY_NA 1 /* no thread binding on macOS: native Argobots answers FEATURE_NA */
+#else
+#define ABTI_AFFINITY_NA 0
+#endif
 int ABT_xstream_set_cpubind(ABT_xstream xstream, int cpuid) {
   ABTI_xstream *x = ABTI_xstream_get(xstream); ABTI_CHECK_NULL(x, ABT_ERR_INV_XSTREAM);
+  if (ABTI_AFFINITY_NA) return ABT_ERR_FEATURE_NA;
   x->cpubind = cpuid;
   send_pe_msg(x->rank, x, ABTI_OP_AFFINITY, cpuid, ABTI_g->affinity_handler);
   return ABT_SUCCESS;
 }
 int ABT_xstream_get_cpubind(ABT_xstream xstream, int *cpuid) {
   ABTI_xstream *x = ABTI_xstream_get(xstream); ABTI_CHECK_NULL(x, ABT_ERR_INV_XSTREAM);
-  if (x->cpubind < 0) return ABT_ERR_FEATURE_NA;
+  if (ABTI_AFFINITY_NA || x->cpubind < 0) return ABT_ERR_FEATURE_NA;
   *cpuid = x->cpubind; return ABT_SUCCESS;
 }
 int ABT_xstream_set_affinity(ABT_xstream xstream, int num_cpuids, int *cpuids) {
   ABTI_xstream *x = ABTI_xstream_get(xstream); ABTI_CHECK_NULL(x, ABT_ERR_INV_XSTREAM);
+  if (ABTI_AFFINITY_NA) return ABT_ERR_FEATURE_NA;
   x->affinity.assign(cpuids, cpuids + (num_cpuids > 0 ? num_cpuids : 0));
   if (num_cpuids > 0) return ABT_xstream_set_cpubind(xstream, cpuids[0]); /* one PE binds to one core */
   return ABT_SUCCESS;
 }
 int ABT_xstream_get_affinity(ABT_xstream xstream, int max_cpuids, int *cpuids, int *num_cpuids) {
   ABTI_xstream *x = ABTI_xstream_get(xstream); ABTI_CHECK_NULL(x, ABT_ERR_INV_XSTREAM);
-  if (x->affinity.empty()) return ABT_ERR_FEATURE_NA;
+  if (ABTI_AFFINITY_NA || x->affinity.empty()) return ABT_ERR_FEATURE_NA;
   int n = (int)x->affinity.size();
   for (int i = 0; i < max_cpuids && i < n; i++) cpuids[i] = x->affinity[i];
   *num_cpuids = n; return ABT_SUCCESS;

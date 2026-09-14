@@ -50,24 +50,30 @@ static void startfn(int, char **) {
   CsdScheduler(-1);
 }
 
-extern "C" {
-
-int ABT_initialized(void) { return ABTI_initialized() ? ABT_SUCCESS : ABT_ERR_UNINITIALIZED; }
-
-int ABT_init(int argc, char **argv) {
-  std::lock_guard<std::mutex> g(g_init_mutex);
-  if (ABTI_initialized()) { g_init_refs++; return ABT_SUCCESS; }
-  ABTI_global *G = new ABTI_global();
+/* ABT_MAX_NUM_XSTREAMS counts secondary streams in practice (Argobots' tests
+ * create that many plus the primary), so one more PE. Unset: be generous --
+ * Argobots only warns past its limit and Mochi configs routinely
+ * oversubscribe; unleased PEs sleep, so an extra PE costs a parked pthread. */
+int ABTI_num_pes_rule() {
   long cores = sysconf(_SC_NPROCESSORS_ONLN);
   if (cores < 1) cores = 1;
-  G->num_pes = (int)env_long("ABT_MAX_NUM_XSTREAMS", cores);
-  if (G->num_pes < 1) G->num_pes = 1;
-  G->default_stacksize = (size_t)env_long("ABT_THREAD_STACKSIZE", 2 * 1024 * 1024);
-  if (G->default_stacksize < 16384) G->default_stacksize = 16384;
-  G->xstreams.assign(G->num_pes, nullptr);
-  ABTI_g = G;
+  long maxx = env_long("ABT_MAX_NUM_XSTREAMS", 0);
+  long n = maxx > 0 ? maxx + 1 : (cores * 2 < 16 ? 16 : cores * 2);
+  if (n < 2) n = 2;
+  if (n > 128) n = 128;
+  return (int)n;
+}
 
-  std::string pes = std::to_string(G->num_pes);
+static bool g_runtime_started = false;
+
+/* the reconverse runtime is torn down once, when the process exits; ABT
+ * objects are created and destroyed per ABT_init/ABT_finalize cycle */
+static void shutdown_runtime() {
+  if (g_runtime_started && ABTI_on_pe() && CmiMyRank() == 0) ConverseFinalize();
+}
+
+static void start_runtime(int num_pes) {
+  std::string pes = std::to_string(num_pes);
   char *av[6];
   av[0] = strdup("abt");
   av[1] = strdup("+pe"); av[2] = strdup(pes.c_str());
@@ -77,7 +83,27 @@ int ABT_init(int argc, char **argv) {
   ConverseInit(5, av, startfn, /*usched=*/1, /*initret=*/1);
   /* rank 0, the primary execution stream, continues here */
   per_pe_setup();
+  g_runtime_started = true;
+  atexit(shutdown_runtime);
+}
 
+extern "C" {
+
+int ABT_initialized(void) { return ABTI_initialized() ? ABT_SUCCESS : ABT_ERR_UNINITIALIZED; }
+
+int ABT_init(int argc, char **argv) {
+  std::lock_guard<std::mutex> g(g_init_mutex);
+  if (ABTI_initialized()) { g_init_refs++; return ABT_SUCCESS; }
+  if (!ABTI_g) {
+    ABTI_global *G = new ABTI_global();
+    G->num_pes = ABTI_num_pes_rule();
+    G->default_stacksize = (size_t)env_long("ABT_THREAD_STACKSIZE", 2 * 1024 * 1024);
+    if (G->default_stacksize < 16384) G->default_stacksize = 16384;
+    G->xstreams.assign(G->num_pes, nullptr);
+    ABTI_g = G;
+    start_runtime(G->num_pes);
+  }
+  ABTI_global *G = ABTI_g;
   int err;
   ABTI_sched *sched = ABTI_sched_create_predef(ABT_SCHED_DEFAULT, 0, nullptr, &err);
   ABTI_xstream *xs = new ABTI_xstream();
@@ -101,15 +127,34 @@ int ABT_init(int argc, char **argv) {
 int ABT_finalize(void) {
   std::lock_guard<std::mutex> g(g_init_mutex);
   if (!ABTI_initialized()) return ABT_ERR_UNINITIALIZED;
-  if (--g_init_refs > 0) return ABT_SUCCESS;
+  if (g_init_refs > 1) { g_init_refs--; return ABT_SUCCESS; }
+  /* a refused finalize leaves everything as it was */
   if (!ABTI_on_pe() || ABTI_tls_xstream != ABTI_g->primary_xstream) return ABT_ERR_INV_XSTREAM;
   if (ABTI_self_thread() != ABTI_g->primary_thread) return ABT_ERR_INV_THREAD;
   {
     std::lock_guard<std::mutex> gx(ABTI_g->xm);
     for (int r = 1; r < ABTI_g->num_pes; r++) if (ABTI_g->xstreams[r]) return ABT_ERR_INV_XSTREAM; /* secondary xstreams must be freed */
   }
-  ABTI_g->initialized.store(0, std::memory_order_release);
-  ConverseFinalize();
+  g_init_refs = 0;
+  ABTI_global *G = ABTI_g;
+  ABTI_xstream *xs = G->primary_xstream;
+  ABTI_thread *pt = G->primary_thread;
+  G->initialized.store(0, std::memory_order_release);
+  /* the primary ULT goes back to being a plain reconverse main thread */
+  CthSetAwakenFn(pt->cth, nullptr, nullptr);
+  CthSetUserData(pt->cth, nullptr);
+  ABTI_pool_disassociate(pt);
+  delete pt;
+  G->primary_thread = nullptr;
+  xs->main_sched->used_by = nullptr;
+  ABTI_sched_destroy(xs->main_sched);
+  G->xstreams[0] = nullptr;
+  G->primary_xstream = nullptr;
+  ABTI_tls_xstream = nullptr;
+  delete xs;
+  CsdSchedTableInstall(0, CsdSchedTableCreate(nullptr, 0));
+  /* the reconverse PEs stay up (sleeping) for a later ABT_init; the runtime
+   * itself is finalized at process exit */
   return ABT_SUCCESS;
 }
 

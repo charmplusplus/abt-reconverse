@@ -65,7 +65,7 @@ static void wait_done(int n) { while (g_done < n) CHECK(ABT_thread_yield()); g_d
 
 int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
-  setenv("ABT_MAX_NUM_XSTREAMS", "4", 0);
+  setenv("ABT_MAX_NUM_XSTREAMS", "3", 0); /* 3 secondary + the primary = 4 PEs */
   CHECK(ABT_init(argc, argv));
   ABT_pool pool; CHECK(ABT_pool_create_basic(ABT_POOL_FIFO, ABT_POOL_ACCESS_MPMC, ABT_FALSE, &pool));
   ABT_xstream xs[3];

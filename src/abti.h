@@ -53,6 +53,11 @@ struct ABTI_pool {
   std::atomic<int> waiters{0};
   std::atomic<long> num_blocked{0}; /* ULTs of this pool currently blocked */
   std::atomic<int> num_scheds{0};   /* schedulers holding this pool */
+  /* PEs parked in CsdIdleWait waiting for this pool (basic_wait idle hook) */
+  std::mutex sm;
+  std::vector<int> sleepers;
+  void add_sleeper(int rank);
+  void remove_sleeper(int rank);
 
   void push(ABTI_thread *t);            /* legal from any thread */
   ABTI_thread *pop();                   /* NULL when empty */
@@ -168,6 +173,9 @@ inline ABTI_thread *ABTI_self_thread() {
   if (!ABTI_on_pe()) return nullptr;
   return reinterpret_cast<ABTI_thread *>(CthGetUserData(CthSelf()));
 }
+
+/* init.cpp: the PE count ABT_init uses (ABT_MAX_NUM_XSTREAMS + 1, or a generous default) */
+int ABTI_num_pes_rule();
 
 /* pool.cpp */
 ABTI_pool *ABTI_pool_create_builtin(ABT_pool_kind kind, ABT_pool_access access, ABT_bool automatic);

@@ -66,7 +66,7 @@ static void migrant(void *arg) {
 
 int main(int argc, char **argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
-  setenv("ABT_MAX_NUM_XSTREAMS", "4", 0);
+  setenv("ABT_MAX_NUM_XSTREAMS", "3", 0); /* 3 secondary + the primary = 4 PEs */
   CHECK(ABT_init(argc, argv));
   ASSERT(ABT_initialized() == ABT_SUCCESS);
 

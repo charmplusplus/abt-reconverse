@@ -28,6 +28,16 @@ void ABTI_pool::push(ABTI_thread *t) {
     std::lock_guard<std::mutex> g(m);
     cv.notify_one();
   }
+  {
+    std::lock_guard<std::mutex> g(sm);
+    for (int r : sleepers) CsdIdleNotify(r);
+  }
+}
+
+void ABTI_pool::add_sleeper(int rank) { std::lock_guard<std::mutex> g(sm); sleepers.push_back(rank); }
+void ABTI_pool::remove_sleeper(int rank) {
+  std::lock_guard<std::mutex> g(sm);
+  for (size_t i = 0; i < sleepers.size(); i++) if (sleepers[i] == rank) { sleepers.erase(sleepers.begin() + i); break; }
 }
 
 ABTI_thread *ABTI_pool::pop() {
@@ -125,6 +135,8 @@ int ABTI_poll_pool(void *ctx) {
 }
 
 extern "C" {
+
+const ABT_pool_config_var ABT_pool_config_automatic = { -2, ABT_POOL_CONFIG_INT };
 
 int ABT_pool_create_basic(ABT_pool_kind kind, ABT_pool_access access, ABT_bool automatic, ABT_pool *newpool) {
   ABTI_CHECK_INITIALIZED();
