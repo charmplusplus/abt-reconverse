@@ -41,13 +41,33 @@ void ABTI_pool::remove_sleeper(int rank) {
   for (size_t i = 0; i < sleepers.size(); i++) if (sleepers[i] == rank) { sleepers.erase(sleepers.begin() + i); break; }
 }
 
+/* The primary ULT is a member of its pool like any other ULT (FIFO order
+ * matters: Margo's monitoring test expects a handler woken earlier to run
+ * before the primary), but its token can only be resumed by its home PE. */
+static inline bool pinned_elsewhere(ABTI_thread *t) {
+  return t->type == ABTI_THREAD_PRIMARY && CthGetHomeRank(t->cth) != CmiMyRank();
+}
+
 ABTI_thread *ABTI_pool::pop() {
-  if (user) return unit_to_thread(def.p_pop(ABTI_pool_handle(this)));
+  if (user) {
+    ABTI_thread *t = unit_to_thread(def.p_pop(ABTI_pool_handle(this)));
+    if (t && pinned_elsewhere(t)) {
+      /* not ours: put it back and take the next one, if any */
+      def.p_push(ABTI_pool_handle(this), t->unit);
+      ABTI_thread *n = unit_to_thread(def.p_pop(ABTI_pool_handle(this)));
+      if (n && pinned_elsewhere(n)) { def.p_push(ABTI_pool_handle(this), n->unit); return nullptr; }
+      return n;
+    }
+    return t;
+  }
   std::lock_guard<std::mutex> g(m);
-  if (q.empty()) return nullptr;
-  ABTI_thread *t = q.front();
-  q.pop_front();
-  return t;
+  for (auto it = q.begin(); it != q.end(); ++it) {
+    if (pinned_elsewhere(*it)) continue;
+    ABTI_thread *t = *it;
+    q.erase(it);
+    return t;
+  }
+  return nullptr;
 }
 
 ABTI_thread *ABTI_pool::pop_timedwait(double abs_deadline) {
@@ -68,10 +88,13 @@ ABTI_thread *ABTI_pool::pop_timedwait(double abs_deadline) {
   }
   cv.wait_for(g, dur, [this] { return !q.empty(); });
   waiters.fetch_sub(1, std::memory_order_acq_rel);
-  if (q.empty()) return nullptr;
-  t = q.front();
-  q.pop_front();
-  return t;
+  for (auto it = q.begin(); it != q.end(); ++it) {
+    if (pinned_elsewhere(*it)) continue;
+    t = *it;
+    q.erase(it);
+    return t;
+  }
+  return nullptr;
 }
 
 size_t ABTI_pool::size() {
