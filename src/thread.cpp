@@ -36,9 +36,7 @@ static void thread_main(void *arg) {
 
 static void unlock_mutex(void *m) { static_cast<std::mutex *>(m)->unlock(); }
 
-/* runs post-switch, on the exiting thread's PE, once it is off its stack */
-static void thread_exit_fn(void *arg) {
-  ABTI_thread *t = static_cast<ABTI_thread *>(arg);
+void ABTI_thread_terminated(ABTI_thread *t) {
   std::vector<CthThread> joiners;
   {
     std::lock_guard<std::mutex> g(t->jm);
@@ -48,9 +46,12 @@ static void thread_exit_fn(void *arg) {
   for (CthThread j : joiners) CthAwakenIfBlocked(j);
   if (t->type == ABTI_THREAD_DETACHED) {
     ABTI_pool_disassociate(t);
-    delete t; /* the CthThread itself is freed by reconverse */
+    delete t; /* a ULT's CthThread is freed by reconverse; a tasklet has none */
   }
 }
+
+/* runs post-switch, on the exiting thread's PE, once it is off its stack */
+static void thread_exit_fn(void *arg) { ABTI_thread_terminated(static_cast<ABTI_thread *>(arg)); }
 
 void ABTI_thread_awaken_fn(CthThread cth, void *arg) {
   ABTI_thread *t = static_cast<ABTI_thread *>(arg);
@@ -125,7 +126,7 @@ int ABTI_thread_join_impl(ABTI_thread *t) {
   if (t->terminated.load(std::memory_order_acquire)) return ABT_SUCCESS;
   ABTI_thread *self = ABTI_self_thread();
   if (self == t) return ABT_ERR_INV_THREAD;
-  if (self) {
+  if (ABTI_can_block(self)) {
     t->jm.lock();
     if (t->terminated.load(std::memory_order_acquire)) { t->jm.unlock(); return ABT_SUCCESS; }
     t->joiners.push_back(self->cth);
@@ -138,13 +139,13 @@ int ABTI_thread_join_impl(ABTI_thread *t) {
 
 void ABTI_thread_destroy(ABTI_thread *t) {
   ABTI_pool_disassociate(t);
-  if (ABTI_on_pe()) CthFree(t->cth); /* off-PE the stack is leaked rather than freed unsafely */
+  if (t->cth && ABTI_on_pe()) CthFree(t->cth); /* off-PE the stack is leaked rather than freed unsafely */
   delete t;
 }
 
 static ABT_thread_state map_state(ABTI_thread *t) {
   if (t->terminated.load(std::memory_order_acquire)) return ABT_THREAD_STATE_TERMINATED;
-  switch (CthGetState(t->cth)) {
+  switch (t->cth ? CthGetState(t->cth) : t->tstate.load()) {
   case CTH_STATE_RUNNING: return ABT_THREAD_STATE_RUNNING;
   case CTH_STATE_BLOCKED: return ABT_THREAD_STATE_BLOCKED;
   case CTH_STATE_TERMINATED: return ABT_THREAD_STATE_TERMINATED;
@@ -500,6 +501,7 @@ int ABT_self_yield_to(ABT_thread thread) { return ABT_thread_yield(); }
 int ABT_self_suspend(void) {
   ABTI_CHECK_INITIALIZED();
   ABTI_thread *t = ABTI_self_thread(); if (!t) return ABTI_on_pe() ? ABT_ERR_INV_THREAD : ABT_ERR_INV_XSTREAM;
+  if (!ABTI_can_block(t)) return ABT_ERR_INV_THREAD; /* a tasklet cannot suspend */
   ABTI_thread_block(t, nullptr, nullptr); return ABT_SUCCESS;
 }
 int ABT_self_set_arg(void *arg) {
@@ -538,9 +540,28 @@ int ABT_self_schedule(ABT_thread thread, ABT_pool pool) { ABTI_UNIMPLEMENTED("AB
 /* ---- tasklets: run as ULTs with a small stack. Argobots' tasklets cannot
  * yield or block; ours technically can, which only makes them more
  * permissive. Handles are ABT_thread handles (same opaque type). ---- */
+/* A tasklet is a stackless work unit (Kale: a plain Converse handler): the
+ * poller runs fn(arg) inline on its own stack when it pops the entry. It
+ * cannot yield or block; the unit itself is the pool entry, no CthThread. */
 static int task_create_impl(ABT_pool pool, void (*fn)(void *), void *arg, ABT_task *newtask) {
-  ABTI_thread_attr a{64 * 1024, nullptr, ABT_TRUE};
-  return thread_create_impl(pool, fn, arg, reinterpret_cast<ABT_thread_attr>(&a), newtask, true);
+  ABTI_CHECK_INITIALIZED();
+  ABTI_pool *p = ABTI_pool_get(pool);
+  ABTI_CHECK_NULL(p, ABT_ERR_INV_POOL);
+  ABTI_thread *t = new ABTI_thread();
+  t->cth = nullptr;
+  t->type = newtask ? ABTI_THREAD_NAMED : ABTI_THREAD_DETACHED;
+  t->fn = fn; t->arg = arg;
+  t->attr = ABTI_thread_attr{0, nullptr, ABT_TRUE};
+  t->id = ABTI_g->next_id.fetch_add(1);
+  t->pool = nullptr; t->unit = ABT_UNIT_NULL;
+  t->last_xstream = nullptr; t->migrate_to = nullptr;
+  t->freed_by_exit = t->type == ABTI_THREAD_DETACHED;
+  t->is_task = true; t->blocked_pool = nullptr;
+  t->tstate.store(CTH_STATE_READY);
+  ABTI_pool_associate(t, p);
+  if (newtask) *newtask = ABTI_thread_handle(t);
+  p->push(t); /* legal from any thread: no PE state involved */
+  return ABT_SUCCESS;
 }
 static inline ABTI_thread *task_get(ABT_task h) { ABTI_thread *t = ABTI_thread_get(h); return (t && t->is_task) ? t : nullptr; }
 

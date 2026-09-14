@@ -57,7 +57,7 @@ static void wake(ABTI_waiter *w) {
 }
 /* block the caller as a waiter already on a list guarded by 'lock' (held) */
 static void wait_on(ABTI_waiter &w, std::atomic<int> &lock, ABTI_thread *self) {
-  if (self) {
+  if (ABTI_can_block(self)) {
     ABTI_thread_block(self, spin_release_cb, &lock); /* BLOCKED, then unlock */
   } else {
     spin_release(lock);
@@ -77,7 +77,7 @@ static bool wait_on_timed(ABTI_waiter &w, std::atomic<int> &lock, ABTI_waitlist 
       spin_release(lock);
       return false;
     }
-    if (self) CthYield(); else sched_yield();
+    if (ABTI_can_block(self)) CthYield(); else sched_yield();
   }
 }
 
@@ -111,7 +111,7 @@ static int mutex_lock(ABTI_mutex *m, bool spin_only) {
     }
     if ((m->attrs & 1) && m->owner == me) { m->nesting++; spin_release(m->slock); return ABT_SUCCESS; }
     if (spin_only) { spin_release(m->slock); sched_yield(); continue; }
-    ABTI_waiter w{self ? self->cth : nullptr, {0}, nullptr};
+    ABTI_waiter w{ABTI_can_block(self) ? self->cth : nullptr, {0}, nullptr};
     wl_push(m->wl, &w);
     wait_on(w, m->slock, self);
     /* woken: retry (another thread may have taken the lock meanwhile) */
@@ -193,7 +193,7 @@ static int cond_wait_impl(ABTI_cond *c, ABTI_mutex *m, double deadline, bool tim
   spin_acquire(c->slock);
   if (c->mutex == nullptr) c->mutex = m;
   else if (c->mutex != m) { spin_release(c->slock); return ABT_ERR_INV_MUTEX; }
-  ABTI_waiter w{self ? self->cth : nullptr, {0}, nullptr};
+  ABTI_waiter w{ABTI_can_block(self) ? self->cth : nullptr, {0}, nullptr};
   wl_push(c->wl, &w);
   ABT_mutex_unlock(reinterpret_cast<ABT_mutex>(m));
   bool signaled = true;
@@ -267,7 +267,7 @@ int ABT_eventual_wait(ABT_eventual eventual, void **value) {
   ABTI_thread *self = ABTI_self_thread();
   spin_acquire(e->slock);
   if (!e->ready) {
-    ABTI_waiter w{self ? self->cth : nullptr, {0}, nullptr};
+    ABTI_waiter w{ABTI_can_block(self) ? self->cth : nullptr, {0}, nullptr};
     wl_push(e->wl, &w);
     wait_on(w, e->slock, self);
     /* the setter published ready and value before releasing the lock */
@@ -288,7 +288,7 @@ int ABT_eventual_timedwait(ABT_eventual eventual, void **value, const struct tim
   double deadline = realtime_to_wall(abstime);
   spin_acquire(e->slock);
   if (!e->ready) {
-    ABTI_waiter w{self ? self->cth : nullptr, {0}, nullptr};
+    ABTI_waiter w{ABTI_can_block(self) ? self->cth : nullptr, {0}, nullptr};
     wl_push(e->wl, &w);
     if (!wait_on_timed(w, e->slock, e->wl, self, deadline)) return ABT_ERR_COND_TIMEDOUT; /* Argobots' code for a timed-out eventual */
   } else {

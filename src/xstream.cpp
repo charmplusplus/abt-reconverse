@@ -230,7 +230,7 @@ static int join_impl(ABTI_xstream *x) {
   x->finishing.store(1, std::memory_order_release);
   if (x->main_sched) x->main_sched->request.fetch_or(ABTI_SCHED_REQ_FINISH); /* ABT_sched_has_to_stop in a user scheduler */
   ABTI_thread *self = ABTI_self_thread();
-  if (self) {
+  if (ABTI_can_block(self)) {
     x->jm.lock();
     if (x->finished.load(std::memory_order_acquire)) { x->jm.unlock(); return ABT_SUCCESS; }
     x->joiners.push_back(self->cth);

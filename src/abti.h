@@ -132,6 +132,7 @@ struct ABTI_thread {
   bool is_task;               /* created by ABT_task_create: a tasklet, run as a small ULT */
   ABTI_pool *blocked_pool;    /* pool whose num_blocked this thread holds while BLOCKED */
   std::atomic<int> blocked_counted{0};
+  std::atomic<int> tstate{0}; /* tasklets (cth == NULL): CTH_STATE_READY/RUNNING/TERMINATED */
   std::jmp_buf exit_jmp;      /* ABT_thread_exit longjmps back to the entry frame */
 };
 
@@ -164,6 +165,7 @@ struct ABTI_global {
 extern ABTI_global *ABTI_g;
 extern thread_local ABTI_xstream *ABTI_tls_xstream; /* per PE */
 extern thread_local CthThread ABTI_tls_runner;       /* the user scheduler running on this PE, or NULL */
+extern thread_local ABTI_thread *ABTI_tls_task;      /* the tasklet running inline on this PE, or NULL */
 CthThread ABTI_choose_fn(void);                      /* CthThFn for shim ULTs */
 void ABTI_start_runner(ABTI_sched *s);               /* on the PE that will run it */
 void ABTI_xstream_release(ABTI_xstream *xs);         /* on the PE: give the lease back */
@@ -195,8 +197,11 @@ inline bool ABTI_on_pe() { return CmiIsPeThread() != 0; }
  * reconverse-internal thread such as a scheduler standin) */
 inline ABTI_thread *ABTI_self_thread() {
   if (!ABTI_on_pe()) return nullptr;
+  if (ABTI_tls_task) return ABTI_tls_task; /* a tasklet runs on the poller's stack */
   return reinterpret_cast<ABTI_thread *>(CthGetUserData(CthSelf()));
 }
+/* a ULT that can suspend (a tasklet or an external thread cannot) */
+inline bool ABTI_can_block(ABTI_thread *t) { return t && t->cth != nullptr && !t->is_task; }
 
 /* init.cpp: the PE count ABT_init uses (ABT_MAX_NUM_XSTREAMS + 1, or a generous default) */
 int ABTI_num_pes_rule();
@@ -215,6 +220,7 @@ void ABTI_thread_awaken_fn(CthThread cth, void *arg);   /* CthAwakenArgFn */
 void ABTI_thread_block(ABTI_thread *self, CthVoidFn after, void *arg); /* blocked count + CthSuspendBlocked */
 int ABTI_thread_join_impl(ABTI_thread *t);
 void ABTI_thread_destroy(ABTI_thread *t);
+void ABTI_thread_terminated(ABTI_thread *t); /* publish TERMINATED, wake joiners, free if detached */
 ABTI_thread *ABTI_thread_wrap_primary(CthThread cth, ABTI_pool *pool);
 ABTI_thread *ABTI_thread_wrap_runner(CthThread cth, ABTI_pool *pool); /* a user scheduler's loop thread, pinned to its PE */
 

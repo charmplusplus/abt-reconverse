@@ -144,9 +144,22 @@ void ABTI_pool_associate(ABTI_thread *t, ABTI_pool *p) {
   }
 }
 
+thread_local ABTI_thread *ABTI_tls_task = nullptr;
+
 void ABTI_pool_run_thread(ABTI_thread *t) {
   if (t->type == ABTI_THREAD_PRIMARY) ABTI_DBG("run primary");
   t->last_xstream = ABTI_tls_xstream;
+  if (!t->cth) {
+    /* a tasklet: run inline on this stack, then retire it */
+    ABTI_thread *prev = ABTI_tls_task;
+    ABTI_tls_task = t;
+    t->tstate.store(CTH_STATE_RUNNING);
+    t->fn(t->arg);
+    t->tstate.store(CTH_STATE_TERMINATED);
+    ABTI_tls_task = prev;
+    ABTI_thread_terminated(t);
+    return;
+  }
   CmiHandleMessage(CthGetToken(t->cth));
 }
 
