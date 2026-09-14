@@ -40,7 +40,7 @@ add_test(NAME abi_surface
 
 # functional tests, linked directly against the static library
 enable_language(C)
-foreach(t core_smoke sync_smoke misc_test)
+foreach(t core_smoke sync_smoke misc_test fork_reinit)
   add_executable(${t} ${t}.c)
   target_link_libraries(${t} PRIVATE abt_static)
   target_include_directories(${t} PRIVATE ${CMAKE_SOURCE_DIR}/include)

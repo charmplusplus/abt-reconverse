@@ -78,6 +78,7 @@ int ABTI_num_pes_rule() {
 }
 
 static bool g_runtime_started = false;
+static pid_t g_runtime_pid = 0; /* the process that started the reconverse runtime */
 
 /* the reconverse runtime is torn down once, when the process exits; ABT
  * objects are created and destroyed per ABT_init/ABT_finalize cycle */
@@ -91,6 +92,7 @@ static void shutdown_runtime() {
       if (x && x->main_sched && x->main_sched->user_def) x->main_sched->request.fetch_or(ABTI_SCHED_REQ_EXIT);
   }
   ConverseFinalize();
+  g_runtime_started = false;
 }
 
 static void start_runtime(int num_pes) {
@@ -105,7 +107,11 @@ static void start_runtime(int num_pes) {
   /* rank 0, the primary execution stream, continues here */
   per_pe_setup();
   g_runtime_started = true;
-  atexit(shutdown_runtime);
+  /* one atexit registration per process: a forked child that restarts the
+   * runtime inherited the parent's registration, and a second shutdown on
+   * a torn-down runtime dereferences freed queues */
+  if (g_runtime_pid != getpid()) atexit(shutdown_runtime);
+  g_runtime_pid = getpid();
 }
 
 extern "C" {
@@ -115,6 +121,14 @@ int ABT_initialized(void) { return ABTI_initialized() ? ABT_SUCCESS : ABT_ERR_UN
 int ABT_init(int argc, char **argv) {
   std::lock_guard<std::mutex> g(g_init_mutex);
   if (ABTI_initialized()) { g_init_refs++; return ABT_SUCCESS; }
+  if (ABTI_g && g_runtime_started && getpid() != g_runtime_pid) {
+    /* a forked child: it inherited the runtime's memory but none of its PE
+     * threads (native Argobots has no threads left after ABT_finalize, so a
+     * fork-then-init child starts from nothing; Margo's unit-test fixtures
+     * fork a helper server per case). Start over. */
+    ABTI_DBG("ABT_init in forked child (pid %d, runtime started by %d): restarting the runtime", (int)getpid(), (int)g_runtime_pid);
+    ABTI_g = nullptr; g_runtime_started = false; g_init_refs = 0;
+  }
   if (!ABTI_g) {
     ABTI_debug = getenv("ABT_RECONVERSE_DEBUG") != nullptr;
     ABTI_global *G = new ABTI_global();
