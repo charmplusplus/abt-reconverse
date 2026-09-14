@@ -44,6 +44,26 @@ own output said "No Errors" — a teardown crash, see core diagnosis C8.
 `ext_thread_join` no longer hangs; it now fails on `ABT_thread_create` from an
 external pthread (C6), which the re-init fix exposed.
 
+## Update: C1 and C2 applied (`src/sched.cpp`, `src/pool.cpp`)
+
+`ABT_sched_config_*` and `ABT_pool_config_*` are implemented as of the commit
+that carries this note, and `ABT_sched_create_basic` now honors
+`ABT_sched_basic_freq` and `ABT_sched_config_automatic`. Re-running the six
+tests C1/C2 touched (the rest of the suite was not re-run):
+
+| test | before | after |
+|---|---|---|
+| sched_basic | fail (77) | **pass** |
+| sched_config | fail (77) | **pass** |
+| pool_config | fail (77) | **pass** |
+| sched_prio | fail (77) on `ABT_sched_config_create` | fail: now reaches `ABT_task_create` — group (a), tasklets |
+| xstream_set_main_sched | fail (77) on `ABT_sched_config_create` | fail: now reaches `ABT_sched_create` with an `ABT_sched_def` — group (a) |
+| sched_user_ws | fail (77) on `ABT_sched_config_create` | fail: now reaches `ABT_sched_create` with an `ABT_sched_def` — group (a) |
+
+So the suite stands at **39/61**, with core C3-C8 and sync S1 outstanding, and
+the three tests above moved from core to out of scope. The per-test table below
+is otherwise as measured in run 2.
+
 ## Per-test results
 
 | test | result | reason |

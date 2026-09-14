@@ -5,6 +5,7 @@
 #include "abti.h"
 #include <chrono>
 #include <algorithm>
+#include <map>
 
 #if defined(__clang__) || defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wunused-parameter"
@@ -133,6 +134,24 @@ int ABTI_poll_pool(void *ctx) {
   ABTI_pool_run_thread(t);
   return 1;
 }
+
+/* ---- pool configuration objects ----------------------------------------
+ * Keys are ABT_pool_config_var::key values; the predefined
+ * ABT_pool_config_automatic uses -2, user-defined keys are the caller's. */
+namespace {
+struct ABTI_pool_config_val {
+  ABT_pool_config_type type;
+  int i;
+  double d;
+  const void *p;
+};
+} // namespace
+
+struct ABTI_pool_config {
+  std::map<int, ABTI_pool_config_val> vals;
+};
+
+static ABTI_pool_config *PC(ABT_pool_config h) { return ABTI_obj<ABTI_pool_config>(h); }
 
 extern "C" {
 
@@ -312,11 +331,53 @@ int ABT_unit_get_thread(ABT_unit unit, ABT_thread *thread) {
 }
 int ABT_unit_set_associated_pool(ABT_unit unit, ABT_pool pool) { ABTI_UNIMPLEMENTED("ABT_unit_set_associated_pool"); }
 
-/* configuration objects and the new-style user definition: not supported */
-int ABT_pool_config_create(ABT_pool_config *config) { ABTI_UNIMPLEMENTED("ABT_pool_config_create"); }
-int ABT_pool_config_free(ABT_pool_config *config) { ABTI_UNIMPLEMENTED("ABT_pool_config_free"); }
-int ABT_pool_config_set(ABT_pool_config config, int key, ABT_pool_config_type type, const void *val) { ABTI_UNIMPLEMENTED("ABT_pool_config_set"); }
-int ABT_pool_config_get(ABT_pool_config config, int key, ABT_pool_config_type *type, void *val) { ABTI_UNIMPLEMENTED("ABT_pool_config_get"); }
+/*
+ * Pool configuration objects: a typed key/value map, the same shape as
+ * ABT_sched_config in src/sched.cpp but keyed by ABT_pool_config_var::key and
+ * with no variadic constructor.  ABT_pool_create does not consume one yet.
+ */
+int ABT_pool_config_create(ABT_pool_config *config) {
+  if (!config) return ABT_ERR_INV_POOL_CONFIG;
+  *config = reinterpret_cast<ABT_pool_config>(new ABTI_pool_config());
+  return ABT_SUCCESS;
+}
+int ABT_pool_config_free(ABT_pool_config *config) {
+  if (!config) return ABT_ERR_INV_POOL_CONFIG;
+  ABTI_pool_config *c = PC(*config);
+  if (!c) return ABT_ERR_INV_POOL_CONFIG;
+  delete c;
+  *config = ABT_POOL_CONFIG_NULL;
+  return ABT_SUCCESS;
+}
+/* val == NULL deletes the entry */
+int ABT_pool_config_set(ABT_pool_config config, int key, ABT_pool_config_type type, const void *val) {
+  ABTI_pool_config *c = PC(config);
+  if (!c) return ABT_ERR_INV_POOL_CONFIG;
+  if (!val) { c->vals.erase(key); return ABT_SUCCESS; }
+  ABTI_pool_config_val v{};
+  v.type = type;
+  if (type == ABT_POOL_CONFIG_INT) v.i = *(const int *)val;
+  else if (type == ABT_POOL_CONFIG_DOUBLE) v.d = *(const double *)val;
+  else v.p = *(void *const *)val;
+  c->vals[key] = v;
+  return ABT_SUCCESS;
+}
+/* an unset key is an error and must leave both outputs untouched */
+int ABT_pool_config_get(ABT_pool_config config, int key, ABT_pool_config_type *type, void *val) {
+  ABTI_pool_config *c = PC(config);
+  if (!c) return ABT_ERR_INV_POOL_CONFIG;
+  auto it = c->vals.find(key);
+  if (it == c->vals.end()) return ABT_ERR_INV_POOL_CONFIG;
+  if (type) *type = it->second.type;
+  if (val) {
+    if (it->second.type == ABT_POOL_CONFIG_INT) *(int *)val = it->second.i;
+    else if (it->second.type == ABT_POOL_CONFIG_DOUBLE) *(double *)val = it->second.d;
+    else *(const void **)val = it->second.p;
+  }
+  return ABT_SUCCESS;
+}
+
+/* the new-style user definition object: still not supported */
 int ABT_pool_user_def_create(ABT_pool_user_create_unit_fn p_create_unit, ABT_pool_user_free_unit_fn p_free_unit, ABT_pool_user_is_empty_fn p_is_empty, ABT_pool_user_pop_fn p_pop, ABT_pool_user_push_fn p_push, ABT_pool_user_def *newdef) { ABTI_UNIMPLEMENTED("ABT_pool_user_def_create"); }
 int ABT_pool_user_def_free(ABT_pool_user_def *def) { ABTI_UNIMPLEMENTED("ABT_pool_user_def_free"); }
 int ABT_pool_user_def_set_init(ABT_pool_user_def def, ABT_pool_user_init_fn p_init) { ABTI_UNIMPLEMENTED("ABT_pool_user_def_set_init"); }

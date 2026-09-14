@@ -2,6 +2,9 @@
  * becomes the PE's poll-table weights when an xstream runs it. */
 #include "abti.h"
 
+#include <cstdarg>
+#include <map>
+
 #if defined(__clang__) || defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 #endif
@@ -12,6 +15,39 @@ ABT_sched_config_var ABT_sched_config_var_end = { .idx = -1, .type = ABT_SCHED_C
 ABT_sched_config_var ABT_sched_config_access = { .idx = -2, .type = ABT_SCHED_CONFIG_INT };
 ABT_sched_config_var ABT_sched_config_automatic = { .idx = -3, .type = ABT_SCHED_CONFIG_INT };
 ABT_sched_config_var ABT_sched_basic_freq = { .idx = -4, .type = ABT_SCHED_CONFIG_INT };
+}
+
+/* ---- scheduler configuration objects ------------------------------------
+ * A small typed key/value map.  Keys are ABT_sched_config_var::idx values:
+ * the predefined vars use negative idx (-1 end, -2 access, -3 automatic,
+ * -4 basic_freq), user-defined vars number themselves 0, 1, 2, ... and
+ * ABT_sched_config_read() reads them back positionally by that number. */
+namespace {
+struct ABTI_sched_config_val {
+  ABT_sched_config_type type;
+  int i;
+  double d;
+  const void *p;
+};
+} // namespace
+
+struct ABTI_sched_config {
+  std::map<int, ABTI_sched_config_val> vals;
+};
+
+static ABTI_sched_config *SC(ABT_sched_config h) { return ABTI_obj<ABTI_sched_config>(h); }
+
+/* the predefined int knobs a basic scheduler understands */
+static void sched_apply_config(ABTI_sched *s, ABT_sched_config config) {
+  ABTI_sched_config *c = SC(config);
+  if (!c) return;
+  auto it = c->vals.find(ABT_sched_basic_freq.idx);
+  if (it != c->vals.end() && it->second.type == ABT_SCHED_CONFIG_INT && it->second.i > 0)
+    s->event_freq = it->second.i;
+  it = c->vals.find(ABT_sched_config_automatic.idx);
+  if (it != c->vals.end() && it->second.type == ABT_SCHED_CONFIG_INT)
+    s->automatic = it->second.i ? ABT_TRUE : ABT_FALSE;
+  /* ABT_sched_config_access is ignored by Argobots too */
 }
 
 ABTI_sched *ABTI_sched_create_predef(ABT_sched_predef predef, int num_pools, ABT_pool *pools, int *err) {
@@ -79,7 +115,7 @@ int ABT_sched_create_basic(ABT_sched_predef predef, int num_pools, ABT_pool *poo
   int err;
   ABTI_sched *s = ABTI_sched_create_predef(predef, num_pools, pools, &err);
   if (!s) return err;
-  /* config objects are not supported (Margo passes ABT_SCHED_CONFIG_NULL) */
+  sched_apply_config(s, config); /* ABT_SCHED_CONFIG_NULL is a no-op */
   *newsched = ABTI_sched_handle(s);
   return ABT_SUCCESS;
 }
@@ -142,10 +178,86 @@ int ABT_sched_has_to_stop(ABT_sched sched, ABT_bool *stop) {
   if (r & ABTI_SCHED_REQ_FINISH) { size_t n; ABT_sched_get_total_size(sched, &n); *stop = n == 0 ? ABT_TRUE : ABT_FALSE; return ABT_SUCCESS; }
   *stop = ABT_FALSE; return ABT_SUCCESS;
 }
-int ABT_sched_config_create(ABT_sched_config *config, ...) { ABTI_UNIMPLEMENTED("ABT_sched_config_create"); }
-int ABT_sched_config_read(ABT_sched_config config, int num_vars, ...) { ABTI_UNIMPLEMENTED("ABT_sched_config_read"); }
-int ABT_sched_config_free(ABT_sched_config *config) { ABTI_UNIMPLEMENTED("ABT_sched_config_free"); }
-int ABT_sched_config_set(ABT_sched_config config, int idx, ABT_sched_config_type type, const void *val) { ABTI_UNIMPLEMENTED("ABT_sched_config_set"); }
-int ABT_sched_config_get(ABT_sched_config config, int idx, ABT_sched_config_type *p_type, void *val) { ABTI_UNIMPLEMENTED("ABT_sched_config_get"); }
+/*
+ * The variadic list is (ABT_sched_config_var, value) pairs terminated by
+ * ABT_sched_config_var_end; the value's type comes from the var.  Structs are
+ * passed by value through varargs here, exactly as Argobots does it.
+ */
+int ABT_sched_config_create(ABT_sched_config *config, ...) {
+  if (!config) return ABT_ERR_INV_SCHED_CONFIG;
+  ABTI_sched_config *c = new ABTI_sched_config();
+  va_list ap;
+  va_start(ap, config);
+  for (;;) {
+    ABT_sched_config_var var = va_arg(ap, ABT_sched_config_var);
+    if (var.idx == ABT_sched_config_var_end.idx) break;
+    ABTI_sched_config_val v{};
+    v.type = var.type;
+    if (var.type == ABT_SCHED_CONFIG_INT) v.i = va_arg(ap, int);
+    else if (var.type == ABT_SCHED_CONFIG_DOUBLE) v.d = va_arg(ap, double);
+    else v.p = va_arg(ap, void *);
+    c->vals[var.idx] = v;
+  }
+  va_end(ap);
+  *config = reinterpret_cast<ABT_sched_config>(c);
+  return ABT_SUCCESS;
+}
+
+/* num_vars pointers, one per index 0..num_vars-1; a NULL pointer skips that
+ * index and an index with no value set leaves the caller's variable alone. */
+int ABT_sched_config_read(ABT_sched_config config, int num_vars, ...) {
+  ABTI_sched_config *c = SC(config);
+  if (!c) return ABT_ERR_INV_SCHED_CONFIG;
+  va_list ap;
+  va_start(ap, num_vars);
+  for (int i = 0; i < num_vars; i++) {
+    void *dst = va_arg(ap, void *);
+    auto it = c->vals.find(i);
+    if (!dst || it == c->vals.end()) continue;
+    if (it->second.type == ABT_SCHED_CONFIG_INT) *(int *)dst = it->second.i;
+    else if (it->second.type == ABT_SCHED_CONFIG_DOUBLE) *(double *)dst = it->second.d;
+    else *(const void **)dst = it->second.p;
+  }
+  va_end(ap);
+  return ABT_SUCCESS;
+}
+
+int ABT_sched_config_free(ABT_sched_config *config) {
+  if (!config) return ABT_ERR_INV_SCHED_CONFIG;
+  ABTI_sched_config *c = SC(*config);
+  if (!c) return ABT_ERR_INV_SCHED_CONFIG;
+  delete c;
+  *config = ABT_SCHED_CONFIG_NULL;
+  return ABT_SUCCESS;
+}
+
+/* val == NULL deletes the entry (Argobots' documented behavior) */
+int ABT_sched_config_set(ABT_sched_config config, int idx, ABT_sched_config_type type, const void *val) {
+  ABTI_sched_config *c = SC(config);
+  if (!c) return ABT_ERR_INV_SCHED_CONFIG;
+  if (!val) { c->vals.erase(idx); return ABT_SUCCESS; }
+  ABTI_sched_config_val v{};
+  v.type = type;
+  if (type == ABT_SCHED_CONFIG_INT) v.i = *(const int *)val;
+  else if (type == ABT_SCHED_CONFIG_DOUBLE) v.d = *(const double *)val;
+  else v.p = *(void *const *)val;
+  c->vals[idx] = v;
+  return ABT_SUCCESS;
+}
+
+/* an unset index is an error and must leave both outputs untouched */
+int ABT_sched_config_get(ABT_sched_config config, int idx, ABT_sched_config_type *p_type, void *val) {
+  ABTI_sched_config *c = SC(config);
+  if (!c) return ABT_ERR_INV_SCHED_CONFIG;
+  auto it = c->vals.find(idx);
+  if (it == c->vals.end()) return ABT_ERR_INV_SCHED_CONFIG;
+  if (p_type) *p_type = it->second.type;
+  if (val) {
+    if (it->second.type == ABT_SCHED_CONFIG_INT) *(int *)val = it->second.i;
+    else if (it->second.type == ABT_SCHED_CONFIG_DOUBLE) *(double *)val = it->second.d;
+    else *(const void **)val = it->second.p;
+  }
+  return ABT_SUCCESS;
+}
 
 } /* extern "C" */

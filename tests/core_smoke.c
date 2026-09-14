@@ -117,8 +117,11 @@ int main(int argc, char **argv) {
   /* 4: migration to another pool */
   ABT_pool other; ABT_xstream xs4;
   CHECK(ABT_pool_create_basic(ABT_POOL_FIFO, ABT_POOL_ACCESS_MPMC, ABT_FALSE, &other));
-  int r4 = ABT_xstream_create_basic(ABT_SCHED_BASIC, 1, &other, ABT_SCHED_CONFIG_NULL, &xs4);
-  ASSERT(r4 == ABT_ERR_INV_XSTREAM_RANK); /* all 4 PEs leased: the cap holds */
+  /* More xstreams than ABT_MAX_NUM_XSTREAMS is legal in Argobots (it only
+   * sizes an array), so this must succeed; it used to expect
+   * ABT_ERR_INV_XSTREAM_RANK, when the PE count was exactly the maximum. */
+  CHECK(ABT_xstream_create_basic(ABT_SCHED_BASIC, 1, &other, ABT_SCHED_CONFIG_NULL, &xs4));
+  CHECK(ABT_xstream_join(xs4)); CHECK(ABT_xstream_free(&xs4));
   ABT_pool p0; CHECK(ABT_xstream_get_main_pools(xs[0], 1, &p0)); ASSERT(p0 == shared);
   /* free one xstream, lease its PE again with the other pool */
   CHECK(ABT_xstream_join(xs[2]));

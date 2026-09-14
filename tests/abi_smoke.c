@@ -95,11 +95,21 @@ int main(void)
     ret = ABT_error_get_str(9999, buf, &len);
     check(ret == ABT_ERR_OTHER, "ABT_error_get_str rejects an unknown code");
 
-    /* 3. Every other entry point is still a stub. */
+    /* 3. A real init/finalize cycle through the installed library.  (These
+     *    two checks asserted ABT_ERR_FEATURE_NA while the shim was a
+     *    skeleton; init and xstreams have been implemented since.) */
     ret = ABT_xstream_self(&xstream);
-    check(ret == ABT_ERR_FEATURE_NA, "ABT_xstream_self() == ABT_ERR_FEATURE_NA");
+    check(ret == ABT_ERR_UNINITIALIZED,
+          "ABT_xstream_self() before init == ABT_ERR_UNINITIALIZED");
     ret = ABT_init(0, NULL);
-    check(ret == ABT_ERR_FEATURE_NA, "ABT_init() == ABT_ERR_FEATURE_NA");
+    check(ret == ABT_SUCCESS, "ABT_init() succeeds");
+    ret = ABT_initialized();
+    check(ret == ABT_SUCCESS, "ABT_initialized() after init == ABT_SUCCESS");
+    ret = ABT_xstream_self(&xstream);
+    check(ret == ABT_SUCCESS && xstream != ABT_XSTREAM_NULL,
+          "ABT_xstream_self() yields the primary xstream");
+    ret = ABT_finalize();
+    check(ret == ABT_SUCCESS, "ABT_finalize() succeeds");
 
     /* 4. Force the linker to resolve a sample across the whole surface. */
     for (i = 0; i < NSAMPLE; i++) {
