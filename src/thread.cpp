@@ -54,6 +54,11 @@ static void thread_exit_fn(void *arg) {
 
 void ABTI_thread_awaken_fn(CthThread cth, void *arg) {
   ABTI_thread *t = static_cast<ABTI_thread *>(arg);
+  /* a blocked ULT stops counting as blocked the moment it is made ready, as
+   * in Argobots (ABTI_ythread_set_ready); counting it until it resumed made
+   * ABT_pool_get_total_size overshoot and Margo's progress loop spin */
+  if (t->blocked_counted.exchange(0, std::memory_order_acq_rel))
+    t->blocked_pool->num_blocked.fetch_sub(1, std::memory_order_acq_rel);
   if (t->migrate_to) {
     ABTI_pool *p = t->migrate_to;
     t->migrate_to = nullptr;
@@ -65,8 +70,10 @@ void ABTI_thread_awaken_fn(CthThread cth, void *arg) {
 void ABTI_thread_block(ABTI_thread *self, CthVoidFn after, void *arg) {
   ABTI_pool *p = self->pool;
   p->num_blocked.fetch_add(1, std::memory_order_acq_rel);
+  self->blocked_pool = p;
+  self->blocked_counted.store(1, std::memory_order_release);
   CthSuspendBlocked(after, arg);
-  p->num_blocked.fetch_sub(1, std::memory_order_acq_rel);
+  /* the waker decremented num_blocked when it made us ready */
 }
 
 ABTI_thread *ABTI_thread_wrap_primary(CthThread cth, ABTI_pool *pool) {
@@ -80,6 +87,7 @@ ABTI_thread *ABTI_thread_wrap_primary(CthThread cth, ABTI_pool *pool) {
   t->last_xstream = nullptr; t->migrate_to = nullptr;
   t->freed_by_exit = false;
   t->is_task = false;
+  t->blocked_pool = nullptr;
   ABTI_pool_associate(t, pool);
   CthSetUserData(cth, t);
   CthSetAwakenFn(cth, ABTI_thread_awaken_fn, t); /* pinned to PE 0 by reconverse */
@@ -148,6 +156,7 @@ static int thread_create_impl(ABT_pool pool, void (*thread_func)(void *), void *
   t->last_xstream = nullptr; t->migrate_to = nullptr;
   t->freed_by_exit = t->type == ABTI_THREAD_DETACHED;
   t->is_task = is_task;
+  t->blocked_pool = nullptr;
   t->cth = CthCreate(thread_main, t, (int)stacksize);
   CthSetUserData(t->cth, t);
   CthSetAwakenFn(t->cth, ABTI_thread_awaken_fn, t);
