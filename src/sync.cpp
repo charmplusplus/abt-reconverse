@@ -81,7 +81,13 @@ static bool wait_on_timed(ABTI_waiter &w, std::atomic<int> &lock, ABTI_waitlist 
   }
 }
 
-static double realtime_to_wall(const struct timespec *abstime);
+/* defined here, outside extern "C": gcc rejects a static function declared
+ * with C++ linkage and defined inside a C linkage block */
+static double realtime_to_wall(const struct timespec *abstime) {
+  struct timespec now; clock_gettime(CLOCK_REALTIME, &now);
+  double rel = (double)(abstime->tv_sec - now.tv_sec) + (double)(abstime->tv_nsec - now.tv_nsec) * 1e-9;
+  return CmiWallTimer() + rel;
+}
 /* ---- mutex ---- */
 struct ABTI_mutex {
   int attrs;                    /* bit 0: recursive (ABT_RECURSIVE_MUTEX_INITIALIZER) */
@@ -276,11 +282,6 @@ int ABT_eventual_wait(ABT_eventual eventual, void **value) {
   }
   if (value) *value = e->value;
   return ABT_SUCCESS;
-}
-static double realtime_to_wall(const struct timespec *abstime) {
-  struct timespec now; clock_gettime(CLOCK_REALTIME, &now);
-  double rel = (double)(abstime->tv_sec - now.tv_sec) + (double)(abstime->tv_nsec - now.tv_nsec) * 1e-9;
-  return CmiWallTimer() + rel;
 }
 int ABT_eventual_timedwait(ABT_eventual eventual, void **value, const struct timespec *abstime) {
   ABTI_eventual *e = E(eventual); ABTI_CHECK_NULL(e, ABT_ERR_INV_EVENTUAL);

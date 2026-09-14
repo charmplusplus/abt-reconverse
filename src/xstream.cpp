@@ -93,6 +93,7 @@ static void send_pe_msg(int rank, ABTI_xstream *xs, int op, int cpuid, int handl
 static void lease_handler(void *vm) {
   ABTI_pe_msg *m = (ABTI_pe_msg *)vm;
   ABTI_tls_xstream = m->xs;
+  m->xs->thread = pthread_self(); m->xs->thread_known.store(1, std::memory_order_release);
   m->xs->state.store(ABT_XSTREAM_STATE_RUNNING);
   CsdSetSleepOnIdle(0); /* a leased PE spins or blocks on its pool, as Argobots does */
   if (m->xs->cpubind >= 0) CmiSetCPUAffinity(m->xs->cpubind);
@@ -388,10 +389,31 @@ int ABT_xstream_set_cpubind(ABT_xstream xstream, int cpuid) {
   send_pe_msg(x->rank, x, ABTI_OP_AFFINITY, cpuid, ABTI_g->affinity_handler);
   return ABT_SUCCESS;
 }
+/* the PE thread's current OS affinity set (Linux); Argobots reads the real
+ * binding back rather than what set_cpubind stored, so a fresh xstream
+ * answers with the cpuset it inherited */
+static int ABTI_xstream_os_affinity(ABTI_xstream *x, std::vector<int> &out) {
+#if ABTI_AFFINITY_NA
+  (void)x; (void)out; return ABT_ERR_FEATURE_NA;
+#else
+  pthread_t t;
+  if (x->thread_known.load(std::memory_order_acquire)) t = x->thread;
+  else if (ABTI_on_pe() && CmiMyRank() == x->rank) t = pthread_self();
+  else return ABT_ERR_FEATURE_NA;
+  cpu_set_t set; CPU_ZERO(&set);
+  if (pthread_getaffinity_np(t, sizeof set, &set) != 0) return ABT_ERR_FEATURE_NA;
+  out.clear();
+  for (int c = 0; c < CPU_SETSIZE; c++) if (CPU_ISSET(c, &set)) out.push_back(c);
+  return out.empty() ? ABT_ERR_FEATURE_NA : ABT_SUCCESS;
+#endif
+}
 int ABT_xstream_get_cpubind(ABT_xstream xstream, int *cpuid) {
   ABTI_xstream *x = ABTI_xstream_get(xstream); ABTI_CHECK_NULL(x, ABT_ERR_INV_XSTREAM);
-  if (ABTI_AFFINITY_NA || x->cpubind < 0) return ABT_ERR_FEATURE_NA;
-  *cpuid = x->cpubind; return ABT_SUCCESS;
+  if (ABTI_AFFINITY_NA) return ABT_ERR_FEATURE_NA;
+  if (x->cpubind >= 0) { *cpuid = x->cpubind; return ABT_SUCCESS; }
+  std::vector<int> cpus; int r = ABTI_xstream_os_affinity(x, cpus);
+  if (r != ABT_SUCCESS) return r;
+  *cpuid = cpus[0]; return ABT_SUCCESS; /* first CPU of the set, as Argobots */
 }
 int ABT_xstream_set_affinity(ABT_xstream xstream, int num_cpuids, int *cpuids) {
   ABTI_xstream *x = ABTI_xstream_get(xstream); ABTI_CHECK_NULL(x, ABT_ERR_INV_XSTREAM);
@@ -402,9 +424,12 @@ int ABT_xstream_set_affinity(ABT_xstream xstream, int num_cpuids, int *cpuids) {
 }
 int ABT_xstream_get_affinity(ABT_xstream xstream, int max_cpuids, int *cpuids, int *num_cpuids) {
   ABTI_xstream *x = ABTI_xstream_get(xstream); ABTI_CHECK_NULL(x, ABT_ERR_INV_XSTREAM);
-  if (ABTI_AFFINITY_NA || x->affinity.empty()) return ABT_ERR_FEATURE_NA;
-  int n = (int)x->affinity.size();
-  for (int i = 0; i < max_cpuids && i < n; i++) cpuids[i] = x->affinity[i];
+  if (ABTI_AFFINITY_NA) return ABT_ERR_FEATURE_NA;
+  std::vector<int> cpus;
+  if (!x->affinity.empty()) cpus = x->affinity;
+  else { int r = ABTI_xstream_os_affinity(x, cpus); if (r != ABT_SUCCESS) return r; }
+  int n = (int)cpus.size();
+  for (int i = 0; i < max_cpuids && i < n; i++) cpuids[i] = cpus[i];
   *num_cpuids = n; return ABT_SUCCESS;
 }
 int ABT_xstream_revive(ABT_xstream xstream) { ABTI_UNIMPLEMENTED("ABT_xstream_revive"); }

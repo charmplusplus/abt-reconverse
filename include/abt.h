@@ -23,6 +23,7 @@ extern "C" {
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/time.h>
+#include <time.h> /* struct timespec for the *_timedwait prototypes (glibc -std=c99) */
 
 /**
  * @ingroup INFO

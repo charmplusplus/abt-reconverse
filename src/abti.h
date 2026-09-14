@@ -98,6 +98,8 @@ struct ABTI_xstream {
   bool primary;
   int cpubind;                /* -1 = unset */
   std::vector<int> affinity;
+  pthread_t thread{};         /* the PE pthread, recorded by the lease handler */
+  std::atomic<int> thread_known{0};
   /* join: the PE's idle hook finishes the lease once pools drain */
   std::atomic<int> finishing{0};
   std::atomic<int> finished{0};

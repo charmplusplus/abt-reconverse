@@ -58,11 +58,19 @@ static void startfn(int, char **) {
 int ABTI_num_pes_rule() {
   long cores = sysconf(_SC_NPROCESSORS_ONLN);
   if (cores < 1) cores = 1;
-  long maxx = env_long("ABT_MAX_NUM_XSTREAMS", 0);
-  long floor_n = cores * 2 < 16 ? 16 : cores * 2;
-  long n = maxx > 0 ? (maxx + 1 > floor_n ? maxx + 1 : floor_n) : floor_n; /* the PE count is fixed at the first init */
+  long n = env_long("ABT_RECONVERSE_NUM_PES", 0); /* explicit override */
+  if (n <= 0) {
+    long maxx = env_long("ABT_MAX_NUM_XSTREAMS", 0);
+    /* set: that many secondaries plus the primary, floor 16 (see above).
+     * Unset: the core count, but no more than 32 -- every PE costs process
+     * start-up and shutdown time (all PEs take part in the runtime's
+     * barriers) even though idle PEs sleep, and a 128-core node would
+     * otherwise get 128 PEs for a Margo server that uses four. */
+    if (maxx > 0) n = maxx + 1 < 16 ? 16 : maxx + 1;
+    else n = cores < 16 ? 16 : (cores > 32 ? 32 : cores);
+  }
   if (n < 2) n = 2;
-  if (n > 128) n = 128;
+  if (n > 256) n = 256; /* a 64-target DAOS engine asks for ~133 */
   return (int)n;
 }
 

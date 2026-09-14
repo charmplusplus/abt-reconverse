@@ -34,7 +34,12 @@ set(RECONVERSE_DIR
 
 set(RECONVERSE_INCLUDE_DIR "${RECONVERSE_DIR}/include")
 set(RECONVERSE_INTERNAL_INCLUDE_DIR "${RECONVERSE_DIR}/include/reconverse-internal")
-set(RECONVERSE_LIBRARY "${RECONVERSE_DIR}/lib/libreconverse.a")
+if(EXISTS "${RECONVERSE_DIR}/lib64/libreconverse.a")   # GNUInstallDirs on RHEL-family Linux
+  set(RECONVERSE_LIBDIR "${RECONVERSE_DIR}/lib64")
+else()
+  set(RECONVERSE_LIBDIR "${RECONVERSE_DIR}/lib")
+endif()
+set(RECONVERSE_LIBRARY "${RECONVERSE_LIBDIR}/libreconverse.a")
 
 foreach(_p "${RECONVERSE_INCLUDE_DIR}/converse.h"
            "${RECONVERSE_INTERNAL_INCLUDE_DIR}/queue.h"
@@ -53,7 +58,9 @@ set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
 
 find_library(HWLOC_LIBRARY NAMES hwloc
-             PATHS /opt/local/lib /usr/local/lib /usr/lib
+             HINTS ENV HWLOC_ROOT ENV HWLOC_DIR
+             PATH_SUFFIXES lib lib64
+             PATHS /opt/local /usr/local /usr
              DOC "hwloc library referenced by libreconverse.a")
 if(NOT HWLOC_LIBRARY)
   message(FATAL_ERROR "hwloc not found; libreconverse.a references hwloc_* symbols")
@@ -123,9 +130,13 @@ install(TARGETS abt_static abt_shared
 install(FILES include/abt.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 # Extra libraries a static consumer must add by hand.
-set(ABT_LIBS_PRIVATE "-L${RECONVERSE_DIR}/lib -lreconverse")
+set(ABT_LIBS_PRIVATE "-L${RECONVERSE_LIBDIR} -lreconverse")
 get_filename_component(_hwloc_dir "${HWLOC_LIBRARY}" DIRECTORY)
-string(APPEND ABT_LIBS_PRIVATE " -L${_hwloc_dir} -lhwloc -lpthread -lc++")
+if(APPLE)
+  string(APPEND ABT_LIBS_PRIVATE " -L${_hwloc_dir} -lhwloc -lpthread -lc++")
+else()
+  string(APPEND ABT_LIBS_PRIVATE " -L${_hwloc_dir} -lhwloc -lpthread -lstdc++")
+endif()
 
 set(ABT_PC_VERSION 1.2.0)
 configure_file(argobots.pc.in "${CMAKE_CURRENT_BINARY_DIR}/argobots.pc" @ONLY)
