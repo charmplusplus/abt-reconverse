@@ -47,3 +47,12 @@ foreach(t core_smoke sync_smoke misc_test)
   add_test(NAME ${t} COMMAND ${t})
   set_tests_properties(${t} PROPERTIES TIMEOUT 120)
 endforeach()
+
+# The Argobots reference tests (upstream test/basic), compiled in place against
+# the shim.  They are a conformance measurement, not a gate: many fail while
+# the shim is incomplete, so they are all named argobots_* and can be run on
+# their own with `ctest -R argobots`.
+option(ABT_BUILD_ARGOBOTS_TESTS "Build the upstream Argobots test/basic suite against the shim" ON)
+if(ABT_BUILD_ARGOBOTS_TESTS)
+  add_subdirectory(argobots-basic)
+endif()
