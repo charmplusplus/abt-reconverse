@@ -344,3 +344,12 @@ but if the shortcut is taken it should be documented, not silent.
   `lldb -b -p <pid> -o 'expr (int)ABT_info_print_all_xstreams((void*)0)' -o detach`;
   it prints each xstream's rank/state/finishing flags and every pool's
   size/blocked counts to the process's stdout.
+
+## Note 2026-09-13 20:10 — eventual_timedwait flakiness is the test's own race
+
+`g_success_counter++` (a plain `volatile int`) is incremented by several
+waiter ULTs that the single `ABT_eventual_set` wakes at once; on the shim
+they resume on different xstreams simultaneously and a lost update gives
+"success_counter = 3 (expected: 4)" in roughly 1 run in 5 under `-j4`. The
+same race exists upstream; native Argobots' wake timing just makes it rare.
+Not a shim defect.
