@@ -408,12 +408,16 @@ int ABT_self_get_type(ABT_unit_type *type) {
   *type = ABTI_self_thread() ? ABT_UNIT_TYPE_THREAD : ABT_UNIT_TYPE_EXT; return ABT_SUCCESS;
 }
 int ABT_self_is_primary(ABT_bool *is_primary) {
+  if (is_primary) *is_primary = ABT_FALSE;
   ABTI_CHECK_INITIALIZED();
+  if (!ABTI_on_pe()) return ABT_ERR_INV_XSTREAM; /* 1.x: external thread */
   ABTI_thread *t = ABTI_self_thread();
   *is_primary = (t && t->type == ABTI_THREAD_PRIMARY) ? ABT_TRUE : ABT_FALSE; return ABT_SUCCESS;
 }
 int ABT_self_on_primary_xstream(ABT_bool *on_primary) {
+  if (on_primary) *on_primary = ABT_FALSE;
   ABTI_CHECK_INITIALIZED();
+  if (!ABTI_on_pe()) return ABT_ERR_INV_XSTREAM; /* 1.x: external thread */
   *on_primary = (ABTI_on_pe() && ABTI_tls_xstream && ABTI_tls_xstream->primary) ? ABT_TRUE : ABT_FALSE; return ABT_SUCCESS;
 }
 int ABT_self_is_unnamed(ABT_bool *is_unnamed) {
