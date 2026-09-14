@@ -55,8 +55,13 @@ function(abt_basic_test name)
   target_compile_options(abt_basic_${name} PRIVATE -w)
   add_test(NAME argobots_${name}
            COMMAND abt_basic_${name} ${T_ARGS})
+  # Argobots' ATS_ERROR() prints "Skipped" and exits 77 when a call returns
+  # ABT_ERR_FEATURE_NA, which is how an upstream test says "this build does not
+  # have the feature I am testing".  Report those as ctest skips, so a FAIL
+  # means a real wrong answer, hang or crash.
   set_tests_properties(argobots_${name} PROPERTIES
                        TIMEOUT 60
+                       SKIP_RETURN_CODE 77
                        ENVIRONMENT "ABT_MAX_NUM_XSTREAMS=6")
   if(T_EXPECTED_FAIL)
     set_tests_properties(argobots_${name} PROPERTIES LABELS "expected_fail")

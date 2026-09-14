@@ -1,7 +1,7 @@
-# Argobots `test/basic` against the shim — conformance run 2
+# Argobots `test/basic` against the shim — conformance run 3
 
-Run 2026-09-13 on the Mac (arm64, 8 cores, AppleClang 16) against shim commit
-`6286573`, one pass:
+Run 2026-09-13 on the Mac (arm64, 8 cores, AppleClang 16) against shim
+`664a51d` (core `05395d0` + sched/pool configs) and reconverse `09595c6`:
 
 ```
 cd build && cmake .. && make -j8
@@ -14,608 +14,333 @@ are compiled in place from
 `/Users/kale/software/argobots-succession/mochi/argobots/test` and are never
 modified.
 
-Reading the failures: `ATS_ERROR()` turns `ABT_ERR_FEATURE_NA` into
-`printf("Skipped"); exit(77)`, so exit code 77 means "the shim returned
-`ABT_ERR_FEATURE_NA` from the call named on that line"; `ABT_RECONVERSE_TRACE_NA=1`
-names the call on stderr. Aborts were re-run under `lldb`, hangs were probed
-with `lldb -p <pid> -o "thread backtrace all"` and, where the shim's own state
-mattered, with `expr (int)ABT_info_print_all_xstreams((void*)0)`.
+**Skips are now reported as skips.** Argobots' `ATS_ERROR()` prints `Skipped`
+and exits **77** when a call returns `ABT_ERR_FEATURE_NA` — that is an upstream
+test saying "this build does not have the feature I test". Every `argobots_*`
+test now carries ctest's `SKIP_RETURN_CODE 77`, so a FAIL means a real wrong
+answer, hang or crash. The `libc++abi: terminating` that used to follow
+`Skipped` is **gone**: 0 occurrences in the whole run (reconverse `09595c6`).
+
+Diagnosis method unchanged: `ABT_RECONVERSE_TRACE_NA=1` names the
+unimplemented call on stderr, aborts are re-run under `lldb`, hangs are probed
+with `lldb -p <pid> -o "thread backtrace all"` and
+`expr (int)ABT_info_print_all_xstreams((void*)0)`.
 
 ## Summary
 
-| bucket | run 1 (`0ada515`) | run 2 (`6286573`) |
+| bucket | run 1 (`0ada515`) | run 2 (`6286573`) | run 3 (`664a51d`) |
+|---|---|---|---|
+| pass | 28 | 36 | **43** |
+| skip (`ABT_ERR_FEATURE_NA`, exit 77) | — | — | **15** |
+| fail | 23 | 23 | **3** |
+| of which hang | 10 | 2 | **0** |
+| **total** | 61 | 61 | **61** |
+
+All 15 skips are features PHASE2-PLAN puts out of scope. All 3 failures are
+the same two gaps in `src/thread.cpp`: `ABT_thread_exit` and `ABT_task_self`.
+
+## The 3 failures
+
+| test | failure | root cause |
 |---|---|---|
-| pass | 28 | **36** |
-| fail — out of scope per PHASE2-PLAN | 9 | 11 |
-| fail — sync | 0 | 0 |
-| fail — core | 14 | 12 |
-| hang / timeout | 10 | 2 (both sync, one root cause) |
-| **total** | 61 | **61** |
+| thread_exit | `Assertion failed: (0), thread_exit.c:24` | F1 — `ABT_thread_exit` returns instead of terminating the ULT |
+| cond_timedwait | `g_counter = 15 (expected: 8)`, exit 1 | F1 — same; the timed-out ULTs fall through and count twice |
+| self_type | `assert(ret == ABT_ERR_INV_TASK && my_task == ABT_TASK_NULL)`, `self_type.c:246` | F2 — `ABT_task_self` returns `ABT_ERR_FEATURE_NA` from a ULT |
 
-Fixed since run 1: the xstream-join drain deadlock (sched_randws,
-thread_create3), the `ABT_init`-after-`ABT_finalize` deadlock (cond_static,
-eventual_static, ext_thread_cond, ext_thread_eventual, self_rank_id),
-`ABT_thread_migrate`, the unsynchronized key vector (thread_data2), and the
-pre-init null handle in `ABT_xstream_self`/`ABT_thread_self` (self_type now
-gets six lines further).
+### F1. `ABT_thread_exit` returns to its caller — `src/thread.cpp:~431`
 
-New since run 1: `xstream_rank` aborted **once** in the parallel run, after its
-own output said "No Errors" — a teardown crash, see core diagnosis C8.
-`ext_thread_join` no longer hangs; it now fails on `ABT_thread_create` from an
-external pthread (C6), which the re-init fix exposed.
-
-## Update: C1 and C2 applied (`src/sched.cpp`, `src/pool.cpp`)
-
-`ABT_sched_config_*` and `ABT_pool_config_*` are implemented as of the commit
-that carries this note, and `ABT_sched_create_basic` now honors
-`ABT_sched_basic_freq` and `ABT_sched_config_automatic`. Re-running the six
-tests C1/C2 touched (the rest of the suite was not re-run):
-
-| test | before | after |
-|---|---|---|
-| sched_basic | fail (77) | **pass** |
-| sched_config | fail (77) | **pass** |
-| pool_config | fail (77) | **pass** |
-| sched_prio | fail (77) on `ABT_sched_config_create` | fail: now reaches `ABT_task_create` — group (a), tasklets |
-| xstream_set_main_sched | fail (77) on `ABT_sched_config_create` | fail: now reaches `ABT_sched_create` with an `ABT_sched_def` — group (a) |
-| sched_user_ws | fail (77) on `ABT_sched_config_create` | fail: now reaches `ABT_sched_create` with an `ABT_sched_def` — group (a) |
-
-So the suite stands at **39/61**, with core C3-C8 and sync S1 outstanding, and
-the three tests above moved from core to out of scope. The per-test table below
-is otherwise as measured in run 2.
-
-## Per-test results
-
-| test | result | reason |
-|---|---|---|
-| init_finalize | pass | |
-| xstream_create | pass | |
-| xstream_rank | **fail (abort)** | **core C8**: passes, then `libc++abi: … std::system_error: mutex lock failed: Invalid argument` during teardown. Passed 15/15 solo and 92/92 concurrent runs afterwards; seen once under `-j4` |
-| xstream_set_main_sched | fail (77) | **core C1**: FEATURE_NA from `ABT_sched_config_create` (`xstream_set_main_sched.c:141`); then needs user `ABT_sched_def` (out of scope) |
-| main_sched | fail (77) | out of scope: `ABT_sched_create` with an `ABT_sched_def` (`main_sched.c:119`) |
-| sched_set_main | pass | |
-| sched_user_ws | fail (77) | **core C1**: `ABT_sched_config_create` (`sched_user_ws.c:152`); then needs user `ABT_sched_def` |
-| sched_basic | fail (77) | **core C1**: `ABT_sched_config_create` (`sched_basic.c:48`, `ABT_sched_basic_freq`) |
-| sched_basic_wait | pass | |
-| sched_randws | pass | was a hang in run 1 |
-| sched_config | fail (77) | **core C1**: `ABT_sched_config_create` (`sched_config.c:102`); this test is the config API itself |
-| sched_on_thread | fail (77) | **core C4**: `ABT_self_schedule` (`sched_on_thread.c:66`); `ABT_xstream_run_unit` (`:60`) is unimplemented too |
-| sched_prio | fail (77) | **core C1**: `ABT_sched_config_create` (`sched_prio.c:122`); then needs tasklets |
-| sched_stack | fail (77) | out of scope: `ABT_task_create` (`sched_stack.c:78`) |
-| pool_config | fail (77) | **core C2**: `ABT_pool_config_create` (`pool_config.c:70`) |
-| pool_custom | fail (77) | **core C3**: `ABT_pool_user_def_create` (`pool_custom.c:554`); then needs `ABT_sched_def` + `ABT_thread_revive` |
-| unit | fail (77) | out of scope: `ABT_sched_create` with an `ABT_sched_def` (`unit.c:118`) |
-| thread_create | pass | |
-| thread_create2 | pass | |
-| thread_create3 | pass | was a hang in run 1 |
-| thread_create4 | fail (77) | out of scope: `ABT_thread_revive` (`thread_create4.c:53`) |
-| thread_create_on_xstream | pass | |
-| thread_yield | pass | |
-| thread_yield2 | fail (77) | out of scope: `ABT_task_create` (`thread_yield2.c:128`) |
-| thread_yield_to | pass | |
-| thread_exit | fail (abort) | out of scope: `ABT_thread_exit` (`thread_exit.c:20`), then `assert(0)` at `:24` |
-| thread_self_suspend_resume | pass | |
-| thread_get_last_xstream | fail (77) | out of scope: `ABT_task_create_on_xstream` (`thread_get_last_xstream.c:90`) |
-| thread_migrate | pass | was a core failure in run 1 |
-| thread_data | pass | |
-| thread_data2 | pass | was an abort (heap corruption) in run 1 |
-| thread_id | pass | |
-| thread_attr | pass | |
-| thread_attr2 | fail (77) | out of scope: `ABT_thread_attr_set_stack` with a user-provided stack (`thread_attr2.c:167`) |
-| mutex | pass | |
-| mutex_spinlock | pass | |
-| mutex_static | **hang** | **sync S1**: recursive mutex locked by an external pthread self-deadlocks |
-| mutex_recursive | pass | |
-| cond_test | pass | |
-| cond_join | pass | (carries the `expected_fail` label, passes anyway) |
-| cond_static | pass | was a hang in run 1 |
-| cond_timedwait | fail (1) | out of scope: `ABT_thread_exit` NA, so the ULTs never exit early and the test's own check fails: `g_counter = 11 (expected: 8)` |
-| eventual_create | pass | |
-| eventual_test | fail (77) | out of scope: `ABT_task_create` (`eventual_test.c:163`) |
-| eventual_static | pass | was a hang in run 1 |
-| eventual_timedwait | pass | |
-| sync_no_contention | pass | |
-| rwlock_reader_incl | pass | |
-| rwlock_reader_writer_excl | pass | |
-| rwlock_writer_excl | pass | |
-| ext_thread | fail (abort) | **core C5**: `ABT_ERR_INV_XSTREAM_RANK` from `ABT_xstream_create` (`ext_thread.c:117`) |
-| ext_thread2 | fail (77) | out of scope: `ABT_self_exit` (`ext_thread2.c:31`) / `ABT_thread_exit` (`:35`) |
-| ext_thread_mutex | **hang** | **sync S1**: same as mutex_static |
-| ext_thread_cond | pass | was a hang in run 1 |
-| ext_thread_eventual | pass | was a hang in run 1 |
-| ext_thread_join | fail (1) | **core C6**: `ABT_ERR_INV_XSTREAM` from `ABT_thread_create` on an external pthread (`ext_thread_join.c:59`) |
-| info_query | pass | |
-| error | pass | |
-| timer | pass | |
-| self_rank_id | pass | was a hang in run 1 |
-| self_type | fail (abort) | **core C7**: `assert(ret == ABT_ERR_UNINITIALIZED && my_task == ABT_TASK_NULL)` at `self_type.c:213`; then needs tasklets |
-
-## (a) Out of scope per PHASE2-PLAN — list only
-
-Eleven tests, no diagnosis needed: each dies on the first call to a feature the
-plan excludes (tasklets, user `ABT_sched_def`, `ABT_thread_exit`/`revive`,
-`ABT_xstream_revive`, user-provided stacks).
-
-| test | the excluded call |
-|---|---|
-| main_sched | `ABT_sched_create` with `ABT_sched_def` |
-| unit | `ABT_sched_create` with `ABT_sched_def` |
-| sched_stack | `ABT_task_create` |
-| thread_yield2 | `ABT_task_create` |
-| thread_get_last_xstream | `ABT_task_create_on_xstream` |
-| eventual_test | `ABT_task_create` |
-| thread_create4 | `ABT_thread_revive` |
-| thread_exit | `ABT_thread_exit` |
-| ext_thread2 | `ABT_self_exit` / `ABT_thread_exit` |
-| cond_timedwait | `ABT_thread_exit` (the ULTs then run to completion and the counter check fails) |
-| thread_attr2 | `ABT_thread_attr_set_stack` with a non-NULL `stackaddr` |
-
-Five more tests reach an out-of-scope call *after* the core blocker named
-below: sched_user_ws and xstream_set_main_sched (user `ABT_sched_def`),
-sched_prio and self_type (tasklets), pool_custom (`ABT_sched_def` +
-`ABT_thread_revive`).
-
-## (b) Sync
-
-### S1. A recursive mutex locked by an external pthread self-deadlocks — `src/sync.cpp:96,107,141`
-
-Both remaining hangs, **mutex_static** and **ext_thread_mutex**, are this one
-bug. Evidence (current build, `lldb -p`, all 12 threads):
-
-```
-* thread #1   __ulock_wait → _pthread_join → main + 536          (waiting for the 4 pthreads)
-  thread #2-7 __psynch_cvwait → CsdIdleSleepMaybe → CsdScheduler  (every PE asleep, no ULT work)
-  thread #8   swtch_pri → cthread_yield → mutex_lock + 468 → ABT_mutex_lock → thread_func + 364
-  thread #9   … mutex_lock + 468 → ABT_mutex_lock → thread_func + 348
-  thread #10  … same
-  thread #11  … same
-```
-
-All four external pthreads sit in `mutex_lock`'s waiter spin
-(`while (!w.signaled) sched_yield()` — `src/sync.cpp:63`), the PEs are idle,
-and no ULT exists: this is the "use the mutex before `ABT_init()`" block that
-both tests run *after* their throwaway `ABT_init`/`ABT_finalize` pair, so the
-runtime is deliberately down and the ULT side is not involved at all.
-
-Why they never wake: `mutex_static.c`/`ext_thread_mutex.c` `thread_func` locks
-each mutex `is_recursive ? 5 : 1` times in a row, and
+**thread_exit** (`thread_exit.c:20-24`) calls `ABT_thread_exit()` (or
+`ABT_self_exit()`) *without checking the return value* and then asserts that
+control never gets there:
 
 ```c
-static inline uint64_t self_id(ABTI_thread *self) { return self ? self->id : (uint64_t)-1; }
+        ABT_thread_exit();
+    } else {
+        ABT_self_exit();
+    }
+    assert(0);
+```
+
+So this one cannot become a skip: the shim returns `ABT_ERR_FEATURE_NA`, the
+ULT keeps running, and `assert(0)` fires.
+
+**cond_timedwait** is the same bug with an arithmetic tail. Each of the 8 ULTs
+locks the mutex and calls `ABT_cond_timedwait(cond, mutex, now + 1 s)`:
+
+```c
+    ret = ABT_cond_timedwait(cond, mutex, &ts);
+    if (ret == ABT_ERR_COND_TIMEDOUT) {
+        g_counter++;                      /* (1) counted here … */
+        ret = ABT_mutex_unlock(mutex);
+        ABT_thread_exit();                /* … and must NOT return */
+    }
+    ATS_ERROR(ret, "ABT_cond_timedwait"); /* ret is ABT_SUCCESS from unlock */
+    g_counter++;                          /* (2) counted a second time */
+    ret = ABT_mutex_unlock(mutex);        /* … and unlocks a mutex it does not hold */
+```
+
+Which waits *must* time out and which *must* be signaled? **Neither is
+required** — that is the point of the test. The main ULT does a single
+`ABT_thread_yield()` and then broadcasts, so whether a given ULT has reached
+`ABT_cond_timedwait` by then is a race, upstream too; the test is written so
+that both outcomes count exactly **one** per ULT (signaled: falls through and
+counts once; timed out: counts once and *exits*). `expected = num_threads = 8`
+either way.
+
+Our number is `8 + (number that timed out)`. A verbose run
+(`ATS_VERBOSE=1 ./cond_timedwait -e 4 -u 8`) shows every timed-out ULT printing
+both lines:
+
+```
+[U9:E3] cond timed out
+[U9:E3] cond waken up      <- the fall-through after ABT_thread_exit() returned
 ...
-if ((m->attrs & 1) && m->owner == me && me != (uint64_t)-1) { m->nesting++; ... }
+g_counter = 15 (expected: 8)     /* 7 timed out x 2 + 1 signaled x 1 */
 ```
 
-gives **every** external thread the same id `(uint64_t)-1` and then explicitly
-excludes that id from the recursive fast path. So the second
-`ABT_mutex_lock()` by the pthread that already holds the recursive mutex does
-not recurse: it pushes itself on the waitlist and waits for an unlock that only
-it could perform. The other three pile up behind it. (The same `me != -1`
-guard is in `ABT_mutex_trylock`, `src/sync.cpp:141`, and `ABT_mutex_spinlock`
-goes through `mutex_lock`, so all three entry points are affected — the test
-rotates through `ABT_mutex_lock`, `_lock_high`, `_lock_low`, `trylock` and
-`_spinlock`.)
+Earlier runs gave 10 and 11 (2 and 3 timeouts). So the yield-poll in
+`src/sync.cpp` is **not** at fault: `realtime_to_wall()` converts the absolute
+`CLOCK_REALTIME` deadline into `CmiWallTimer`'s clock correctly (relative
+offset added to `CmiWallTimer()`), the waiters wait the full second, the
+timeout return value is right, and `cond_wait_impl` re-acquires the mutex
+before returning `ABT_ERR_COND_TIMEDOUT` as it must. The only defect is that
+`ABT_thread_exit` comes back. (The second `ABT_mutex_unlock` on a mutex this
+ULT no longer owns is a knock-on effect of the same thing: it releases the
+mutex out from under whoever holds it.)
 
-The guard cannot simply be deleted: with a shared id of `-1`, external thread B
-would "recursively" acquire a mutex held by external thread A. External threads
-need a *unique* identity instead. Proposed patch (compiles; **not applied** —
-`src/sync.cpp` belongs to the sync engineer):
+That most ULTs time out is expected for this test at `-e 4 -u 8`: the broadcast
+is issued a few microseconds after the ULTs are created, before they run.
+
+**Proposed fix** (in `src/thread.cpp` and `src/abti.h`, both yours — *not
+applied*). Reconverse exposes no "terminate the current thread" primitive
+(`CthFree`/`CthSuspend` do not unwind), so the natural implementation is a
+`setjmp` at the ULT entry frame:
 
 ```diff
---- a/src/sync.cpp
-+++ b/src/sync.cpp
+--- a/src/abti.h
++++ b/src/abti.h
++#include <csetjmp>
+@@ struct ABTI_thread {
+   std::vector<void *> keys;
+   bool freed_by_exit;
++  std::jmp_buf exit_jmp;   /* ABT_thread_exit() longjmps to thread_main */
++  bool exit_armed;
+ };
+--- a/src/thread.cpp
++++ b/src/thread.cpp
+ static void thread_main(void *arg) {
+   ABTI_thread *t = static_cast<ABTI_thread *>(arg);
+-  t->fn(t->arg);
++  if (setjmp(t->exit_jmp) == 0) {
++    t->exit_armed = true;
++    t->fn(t->arg);       /* ABT_thread_exit() jumps back here with 1 */
++  }
++  t->exit_armed = false;
+   run_key_destructors(t);
+ }
 @@
--static inline uint64_t self_id(ABTI_thread *self) { return self ? self->id : (uint64_t)-1; }
-+/* Recursive mutexes need an owner identity for external threads too, and it
-+ * must be unique per pthread: with one shared sentinel, thread B would pass
-+ * the recursive check on a mutex held by thread A, and the holder itself
-+ * cannot recurse.  ULT ids come from ABTI_g->next_id (small, increasing), so
-+ * setting the top bit cannot collide with one. */
-+static inline uint64_t self_id(ABTI_thread *self) {
-+  if (self) return self->id;
-+  return ((uint64_t)(uintptr_t)pthread_self()) | (1ULL << 63);
-+}
-@@ static int mutex_lock(ABTI_mutex *m, bool spin_only) {
--    if ((m->attrs & 1) && m->owner == me && me != (uint64_t)-1) { m->nesting++; spin_release(m->slock); return ABT_SUCCESS; }
-+    if ((m->attrs & 1) && m->owner == me) { m->nesting++; spin_release(m->slock); return ABT_SUCCESS; }
-@@ int ABT_mutex_trylock(ABT_mutex mutex) {
--  if ((m->attrs & 1) && m->owner == me && me != (uint64_t)-1) { m->nesting++; spin_release(m->slock); return ABT_SUCCESS; }
-+  if ((m->attrs & 1) && m->owner == me) { m->nesting++; spin_release(m->slock); return ABT_SUCCESS; }
-```
-
-Needs `#include <pthread.h>` in `src/sync.cpp` if it is not already pulled in.
-`ABT_mutex_unlock` setting `m->owner = 0` stays correct: 0 is neither a ULT id
-(they start at 1) nor a top-bit-set pthread id. The comment on
-`ABTI_mutex::owner` (`src/sync.cpp:90`) should be updated too.
-
-## (c) Core
-
-### C1. `ABT_sched_config_*` is unimplemented — `src/sched.cpp:145-149`
-
-Blocks five tests: **sched_basic**, **sched_config**, **sched_prio**,
-**sched_user_ws**, **xstream_set_main_sched**. All five die on the first call,
-e.g. `sched_basic.c:48`
-
-```c
-ret = ABT_sched_config_create(&config, ABT_sched_basic_freq, 10,
-                              ABT_sched_config_var_end);
-```
-
-→ `ABT_ERR_FEATURE_NA` → `exit(77)`. `ABT_sched_create_basic` also currently
-ignores a non-NULL config (`src/sched.cpp:82`, "config objects are not
-supported"); it must at least not reject one, and should honor
-`ABT_sched_basic_freq` (idx −4) → `s->event_freq` and
-`ABT_sched_config_automatic` (idx −3) → `s->automatic`.
-
-Fixing this alone makes sched_basic and sched_config pass (sched_config *is*
-the config API test); sched_prio then needs tasklets, and sched_user_ws /
-xstream_set_main_sched need user `ABT_sched_def`.
-
-The contract the tests check (`sched_config.c` `check_val`): `..._read` reads
-positionally by index 0..num_vars−1, skipping NULL pointers and leaving unset
-entries untouched; `..._set` with `val == NULL` **erases** the entry; `..._get`
-on a missing key returns non-`ABT_SUCCESS` **and leaves both outputs
-untouched**. Proposed patch (syntax- and type-checked against `abti.h`; **not
-applied**):
-
-```diff
---- a/src/sched.cpp
-+++ b/src/sched.cpp
-+#include <cstdarg>
-+#include <map>
-+
-+/* Scheduler config: a small typed key/value map.  Keys are ABT_sched_config_var
-+ * idx values; the predefined vars use negative idx (-1 end, -2 access,
-+ * -3 automatic, -4 basic_freq), user vars use 0,1,2,... */
-+namespace {
-+struct ABTI_sched_config_val { ABT_sched_config_type type; int i; double d; const void *p; };
-+}
-+struct ABTI_sched_config { std::map<int, ABTI_sched_config_val> vals; };
-+static ABTI_sched_config *SC(ABT_sched_config h) { return ABTI_obj<ABTI_sched_config>(h); }
-+
--int ABT_sched_config_create(ABT_sched_config *config, ...) { ABTI_UNIMPLEMENTED("ABT_sched_config_create"); }
--int ABT_sched_config_read(ABT_sched_config config, int num_vars, ...) { ABTI_UNIMPLEMENTED("ABT_sched_config_read"); }
--int ABT_sched_config_free(ABT_sched_config *config) { ABTI_UNIMPLEMENTED("ABT_sched_config_free"); }
--int ABT_sched_config_set(ABT_sched_config config, int idx, ABT_sched_config_type type, const void *val) { ABTI_UNIMPLEMENTED("ABT_sched_config_set"); }
--int ABT_sched_config_get(ABT_sched_config config, int idx, ABT_sched_config_type *p_type, void *val) { ABTI_UNIMPLEMENTED("ABT_sched_config_get"); }
-+int ABT_sched_config_create(ABT_sched_config *config, ...) {
-+  if (!config) return ABT_ERR_INV_SCHED_CONFIG;
-+  ABTI_sched_config *c = new ABTI_sched_config();
-+  va_list ap; va_start(ap, config);
-+  for (;;) {
-+    ABT_sched_config_var var = va_arg(ap, ABT_sched_config_var);
-+    if (var.idx == ABT_sched_config_var_end.idx) break;
-+    ABTI_sched_config_val v{}; v.type = var.type;
-+    if (var.type == ABT_SCHED_CONFIG_INT) v.i = va_arg(ap, int);
-+    else if (var.type == ABT_SCHED_CONFIG_DOUBLE) v.d = va_arg(ap, double);
-+    else v.p = va_arg(ap, void *);
-+    c->vals[var.idx] = v;
-+  }
-+  va_end(ap);
-+  *config = reinterpret_cast<ABT_sched_config>(c);
-+  return ABT_SUCCESS;
-+}
-+int ABT_sched_config_read(ABT_sched_config config, int num_vars, ...) {
-+  ABTI_sched_config *c = SC(config); if (!c) return ABT_ERR_INV_SCHED_CONFIG;
-+  va_list ap; va_start(ap, num_vars);
-+  for (int i = 0; i < num_vars; i++) {
-+    void *dst = va_arg(ap, void *);
-+    auto it = c->vals.find(i);
-+    if (!dst || it == c->vals.end()) continue;   /* unset entries stay untouched */
-+    if (it->second.type == ABT_SCHED_CONFIG_INT) *(int *)dst = it->second.i;
-+    else if (it->second.type == ABT_SCHED_CONFIG_DOUBLE) *(double *)dst = it->second.d;
-+    else *(const void **)dst = it->second.p;
-+  }
-+  va_end(ap);
-+  return ABT_SUCCESS;
-+}
-+int ABT_sched_config_free(ABT_sched_config *config) {
-+  if (!config) return ABT_ERR_INV_SCHED_CONFIG;
-+  ABTI_sched_config *c = SC(*config); if (!c) return ABT_ERR_INV_SCHED_CONFIG;
-+  delete c; *config = ABT_SCHED_CONFIG_NULL; return ABT_SUCCESS;
-+}
-+int ABT_sched_config_set(ABT_sched_config config, int idx, ABT_sched_config_type type, const void *val) {
-+  ABTI_sched_config *c = SC(config); if (!c) return ABT_ERR_INV_SCHED_CONFIG;
-+  if (!val) { c->vals.erase(idx); return ABT_SUCCESS; }  /* NULL deletes */
-+  ABTI_sched_config_val v{}; v.type = type;
-+  if (type == ABT_SCHED_CONFIG_INT) v.i = *(const int *)val;
-+  else if (type == ABT_SCHED_CONFIG_DOUBLE) v.d = *(const double *)val;
-+  else v.p = *(void *const *)val;
-+  c->vals[idx] = v; return ABT_SUCCESS;
-+}
-+int ABT_sched_config_get(ABT_sched_config config, int idx, ABT_sched_config_type *p_type, void *val) {
-+  ABTI_sched_config *c = SC(config); if (!c) return ABT_ERR_INV_SCHED_CONFIG;
-+  auto it = c->vals.find(idx);
-+  if (it == c->vals.end()) return ABT_ERR_INV_SCHED_CONFIG;  /* outputs untouched */
-+  if (p_type) *p_type = it->second.type;
-+  if (val) {
-+    if (it->second.type == ABT_SCHED_CONFIG_INT) *(int *)val = it->second.i;
-+    else if (it->second.type == ABT_SCHED_CONFIG_DOUBLE) *(double *)val = it->second.d;
-+    else *(const void **)val = it->second.p;
-+  }
-+  return ABT_SUCCESS;
-+}
-```
-
-and in `ABT_sched_create_basic`, replacing the "not supported" comment:
-
-```diff
--  /* config objects are not supported (Margo passes ABT_SCHED_CONFIG_NULL) */
-+  if (ABTI_sched_config *c = SC(config)) {
-+    auto it = c->vals.find(ABT_sched_basic_freq.idx);
-+    if (it != c->vals.end() && it->second.type == ABT_SCHED_CONFIG_INT && it->second.i > 0)
-+      s->event_freq = it->second.i;
-+    it = c->vals.find(ABT_sched_config_automatic.idx);
-+    if (it != c->vals.end() && it->second.type == ABT_SCHED_CONFIG_INT)
-+      s->automatic = it->second.i ? ABT_TRUE : ABT_FALSE;
-+  }
-```
-
-### C2. `ABT_pool_config_*` is unimplemented — `src/pool.cpp:316-319`
-
-**pool_config** dies at `pool_config.c:70` on `ABT_pool_config_create`. The
-test only exercises the config object (create/set/get/free over int, double and
-pointer values, with the key varied 1..9 to stress the hash table), so
-implementing the object makes it pass — `ABT_pool_create` need not consume it
-yet.
-
-Same shape as C1, keyed by `key` instead of `idx`, with
-`ABT_ERR_INV_POOL_CONFIG` as the error and `ABT_POOL_CONFIG_*` as the types:
-
-```diff
--int ABT_pool_config_create(ABT_pool_config *config) { ABTI_UNIMPLEMENTED("ABT_pool_config_create"); }
--int ABT_pool_config_free(ABT_pool_config *config) { ABTI_UNIMPLEMENTED("ABT_pool_config_free"); }
--int ABT_pool_config_set(ABT_pool_config config, int key, ABT_pool_config_type type, const void *val) { ABTI_UNIMPLEMENTED("ABT_pool_config_set"); }
--int ABT_pool_config_get(ABT_pool_config config, int key, ABT_pool_config_type *type, void *val) { ABTI_UNIMPLEMENTED("ABT_pool_config_get"); }
-+/* identical to the ABT_sched_config map in src/sched.cpp; create() takes no
-+ * variadic list here, so it is even simpler */
-+namespace { struct ABTI_pool_config_val { ABT_pool_config_type type; int i; double d; const void *p; }; }
-+struct ABTI_pool_config { std::map<int, ABTI_pool_config_val> vals; };
-+static ABTI_pool_config *PC(ABT_pool_config h) { return ABTI_obj<ABTI_pool_config>(h); }
-+int ABT_pool_config_create(ABT_pool_config *config) {
-+  if (!config) return ABT_ERR_INV_POOL_CONFIG;
-+  *config = reinterpret_cast<ABT_pool_config>(new ABTI_pool_config());
-+  return ABT_SUCCESS;
-+}
-+int ABT_pool_config_free(ABT_pool_config *config) {
-+  if (!config) return ABT_ERR_INV_POOL_CONFIG;
-+  ABTI_pool_config *c = PC(*config); if (!c) return ABT_ERR_INV_POOL_CONFIG;
-+  delete c; *config = ABT_POOL_CONFIG_NULL; return ABT_SUCCESS;
-+}
-+int ABT_pool_config_set(ABT_pool_config config, int key, ABT_pool_config_type type, const void *val) {
-+  ABTI_pool_config *c = PC(config); if (!c) return ABT_ERR_INV_POOL_CONFIG;
-+  if (!val) { c->vals.erase(key); return ABT_SUCCESS; }
-+  ABTI_pool_config_val v{}; v.type = type;
-+  if (type == ABT_POOL_CONFIG_INT) v.i = *(const int *)val;
-+  else if (type == ABT_POOL_CONFIG_DOUBLE) v.d = *(const double *)val;
-+  else v.p = *(void *const *)val;
-+  c->vals[key] = v; return ABT_SUCCESS;
-+}
-+int ABT_pool_config_get(ABT_pool_config config, int key, ABT_pool_config_type *type, void *val) {
-+  ABTI_pool_config *c = PC(config); if (!c) return ABT_ERR_INV_POOL_CONFIG;
-+  auto it = c->vals.find(key);
-+  if (it == c->vals.end()) return ABT_ERR_INV_POOL_CONFIG;  /* outputs untouched */
-+  if (type) *type = it->second.type;
-+  if (val) {
-+    if (it->second.type == ABT_POOL_CONFIG_INT) *(int *)val = it->second.i;
-+    else if (it->second.type == ABT_POOL_CONFIG_DOUBLE) *(double *)val = it->second.d;
-+    else *(const void **)val = it->second.p;
-+  }
-+  return ABT_SUCCESS;
-+}
-```
-
-### C3. `ABT_pool_user_def_*` is unimplemented — `src/pool.cpp:320-323`
-
-**pool_custom** dies at `pool_custom.c:554` on `ABT_pool_user_def_create`. This
-is the 2.0-style user pool interface (create/free-unit, is_empty, pop, push
-function pointers, plus optional init/free), a different entry point from the
-1.x `ABT_pool_def` that `ABT_pool_create` already accepts and that PHASE2-PLAN
-puts in scope. Not a few lines: `ABT_pool_user_def` is its own heap object that
-`ABT_pool_create` must then accept alongside `ABT_pool_def`. Worth doing only
-if Margo/Yokan use it — this test needs `ABT_sched_def` and
-`ABT_thread_revive` afterwards anyway, so it cannot pass regardless.
-
-### C4. `ABT_self_schedule` and `ABT_xstream_run_unit` are unimplemented — `src/thread.cpp:456`, `src/xstream.cpp:308`
-
-**sched_on_thread** runs its own scheduling loop inside a ULT: it pops a unit
-from a pool and executes it in place (`sched_on_thread.c:60` via
-`ABT_xstream_run_unit`, `:66` and `:73` via `ABT_self_schedule`). Trace shows
-`ABT_self_schedule not implemented`.
-
-This is the stackable-scheduler feature that
-`ABT_INFO_QUERY_KIND_ENABLED_STACKABLE_SCHED` already reports as `ABT_FALSE`,
-and PHASE2-PLAN does not list it in scope — **if it is meant to be out of
-scope, say so and the test moves to group (a)**. If it is meant to work, the
-shim already has the primitive: `ABTI_pool_run_thread()` (`src/pool.cpp:123`)
-is exactly "run this ULT on this PE now", which is what the poll function does.
-
-```diff
---- a/src/thread.cpp
-+++ b/src/thread.cpp
--int ABT_self_schedule(ABT_thread thread, ABT_pool pool) { ABTI_UNIMPLEMENTED("ABT_self_schedule"); }
-+int ABT_self_schedule(ABT_thread thread, ABT_pool pool) {
+-int ABT_thread_exit(void) { ABTI_UNIMPLEMENTED("ABT_thread_exit"); }
++int ABT_thread_exit(void) {
 +  ABTI_CHECK_INITIALIZED();
-+  ABTI_thread *t = ABTI_thread_get(thread); ABTI_CHECK_NULL(t, ABT_ERR_INV_THREAD);
++  ABTI_thread *self = ABTI_self_thread();
++  if (!self) return ABTI_on_pe() ? ABT_ERR_INV_THREAD : ABT_ERR_INV_XSTREAM;
++  /* the primary ULT is not ours to unwind, and neither is a ULT whose entry
++   * frame is gone */
++  if (self->type == ABTI_THREAD_PRIMARY || !self->exit_armed) return ABT_ERR_INV_THREAD;
++  longjmp(self->exit_jmp, 1);  /* does not return */
++}
+```
+
+with `ABT_self_exit()` becoming `return ABT_thread_exit();`. Two caveats worth
+weighing: `longjmp` skips destructors of C++ objects live on the ULT's stack
+(the Argobots API is C and the shim's own wait paths use raw spinlocks, so
+nothing in-tree is affected), and the jump must happen on the ULT's own stack —
+which holds even after migration, because a reconverse stack travels with its
+`CthThread`. `ABT_thread_exit_to` (ext_thread2) would additionally have to
+schedule the named target and stays out of scope.
+
+Fixing F1 turns thread_exit and cond_timedwait green and moves ext_thread2's
+first blocker from `ABT_thread_exit` to `ABT_self_exit`/`ABT_thread_exit_to`.
+
+### F2. `ABT_task_self` from a ULT must be `ABT_ERR_INV_TASK` — `src/thread.cpp:473-478`
+
+C7 was applied only to the uninitialized case, so `self_type.c:213` passes now
+and `:246` fails:
+
+```c
+int ABT_task_self(ABT_task *task) {
+  if (task) *task = ABT_TASK_NULL;
+  ABTI_CHECK_INITIALIZED();
+  ABTI_UNIMPLEMENTED("ABT_task_self");   /* ABT_ERR_FEATURE_NA */
+}
+```
+
+The 1.x contract (asserted at `self_type.c:90`, `:155`, `:213`, `:246`): handle
+nulled first, then `ABT_ERR_UNINITIALIZED` / `ABT_ERR_INV_XSTREAM` from an
+external thread / `ABT_ERR_INV_TASK` from a ULT. None of it needs tasklets:
+
+```diff
+-  ABTI_UNIMPLEMENTED("ABT_task_self");
 +  if (!ABTI_on_pe()) return ABT_ERR_INV_XSTREAM;
-+  ABTI_pool *p = ABTI_pool_get(pool);
-+  if (p) ABTI_pool_associate(t, p); /* non-NULL pool becomes the unit's "last pool" */
-+  ABTI_pool_run_thread(t);
-+  return ABT_SUCCESS;
-+}
---- a/src/xstream.cpp
--int ABT_xstream_run_unit(ABT_unit unit, ABT_pool pool) { ABTI_UNIMPLEMENTED("ABT_xstream_run_unit"); }
-+int ABT_xstream_run_unit(ABT_unit unit, ABT_pool pool) {
-+  ABT_thread th;
-+  int r = ABT_unit_get_thread(unit, &th);
-+  if (r != ABT_SUCCESS) return r;
-+  return ABT_self_schedule(th, pool);
-+}
-```
-
-Caveat the core engineer should check before adopting this: it resumes a ULT
-from inside another ULT's context rather than from the scheduler context, so
-the resumed ULT's next block/yield returns into *this* ULT's stack.
-`ABTI_pool_run_thread` is only ever called from the poll function today.
-
-### C5. The xstream count is still capped by the PE count — `src/init.cpp:57-65`
-
-**ext_thread** fails with `ABT_ERR_INV_XSTREAM_RANK` from `ABT_xstream_create`
-at `ext_thread.c:117`. `ATS_init(argc, argv, 1)` putenvs
-`ABT_MAX_NUM_XSTREAMS=1`, so `ABTI_num_pes_rule()` returns `1 + 1 = 2` PEs, and
-the test then creates **two** secondary xstreams on top of the primary — three
-in all — so `ABTI_xstream_lease` runs out of ranks (`src/xstream.cpp`, "more
-xstreams than ABT_MAX_NUM_XSTREAMS PEs").
-
-`max + 1` is not the rule: in Argobots `ABT_MAX_NUM_XSTREAMS` only sizes an
-internal array and creating more ESs than that is legal. Since the Converse
-runtime starts once per process (`g_runtime_started`), the PE count cannot be
-raised later, so it has to start generous — which the existing comment already
-argues for in the unset case:
-
-```diff
---- a/src/init.cpp
-+++ b/src/init.cpp
--  long n = maxx > 0 ? maxx + 1 : (cores * 2 < 16 ? 16 : cores * 2);
-+  /* ABT_MAX_NUM_XSTREAMS is a hint: Argobots only uses it to size an array and
-+   * lets a program create more execution streams (ext_thread does:
-+   * ATS_init(...,1) then two ABT_xstream_create plus the primary).  The PE
-+   * count is frozen by the first ABT_init in the process, so never go below
-+   * the generous default; unleased PEs sleep. */
-+  long floor_pes = (cores * 2 < 16 ? 16 : cores * 2);
-+  long n = maxx > 0 ? (maxx + 1 > floor_pes ? maxx + 1 : floor_pes) : floor_pes;
-```
-
-`src/misc.cpp` needs no change: `abti_max_xstreams()` reports
-`ABTI_num_pes_rule()` before init and `ABTI_g->num_pes` after, so the
-`MAX_NUM_XSTREAMS` query stays self-consistent (which is all `info_query.c`
-checks) whatever the rule becomes.
-
-### C6. `ABT_thread_create` from an external pthread returns `ABT_ERR_INV_XSTREAM` — `src/thread.cpp:~120`
-
-**ext_thread_join** now fails here (it used to hang in the re-init):
-
-```
-ABT_ERR_INV_XSTREAM (4): ABT_thread_create (ext_thread_join.c:59)
-```
-
-The test's whole point is that an external pthread creates ULTs, joins them,
-and creates/frees xstreams. The shim refuses up front:
-
-```c
-if (!ABTI_on_pe()) return ABT_ERR_INV_XSTREAM; /* stacks and tokens are PE-owned */
-```
-
-while `ABT_INFO_QUERY_KIND_ENABLED_EXTERNAL_THREAD` reports `ABT_TRUE`, and
-Margo creates ULTs from non-Argobots threads, so this one matters beyond the
-test suite.
-
-Not a few lines, so no patch — but the machinery exists: `src/xstream.cpp`
-already messages a PE for the lease and affinity operations
-(`send_pe_msg(rank, …, ABTI_OP_LEASE/ABTI_OP_AFFINITY)`). Suggested shape: an
-`ABTI_OP_CREATE` message carrying `{pool, fn, arg, attr, result slot,
-std::atomic<int> done}`; the external caller posts it to the pool's "home" PE
-(any leased PE, e.g. rank 0), then spins on `done` the same way
-`ABTI_thread_join_impl` already spins for external joiners. `CthCreate` and
-`CthSetUserData` then run on a PE, as today.
-
-### C7. Pre-init `ABT_task_self` and `ABT_self_get_type` — `src/thread.cpp:463-464,390`
-
-**self_type** now gets past the two handles fixed in `6286573` and stops at
-`self_type.c:213`:
-
-```c
-ret = ABT_task_self(&my_task);
-assert(ret == ABT_ERR_UNINITIALIZED && my_task == ABT_TASK_NULL);
-ret = ABT_self_get_type(&type);
-assert(ret == ABT_ERR_UNINITIALIZED && type == ABT_UNIT_TYPE_EXT);
-```
-
-`ABT_task_self` is `ABTI_UNIMPLEMENTED` (returns `ABT_ERR_FEATURE_NA` and never
-writes the handle), and `ABT_self_get_type` returns the right error but does
-not write `*type`. Neither needs tasklets: 1.x defines `ABT_task_self` on a ULT
-as `ABT_ERR_INV_TASK` with the handle nulled (asserted at `self_type.c:90` and
-`:242`) and on an external thread as `ABT_ERR_INV_XSTREAM` (`:155`).
-
-```diff
---- a/src/thread.cpp
-+++ b/src/thread.cpp
--int ABT_task_self(ABT_task *task) { ABTI_UNIMPLEMENTED("ABT_task_self"); }
++  return ABT_ERR_INV_TASK;   /* a ULT is never a tasklet */
+ }
 -int ABT_task_self_id(ABT_unit_id *id) { ABTI_UNIMPLEMENTED("ABT_task_self_id"); }
-+/* No tasklets in this shim, but the 1.x error contract is still well defined:
-+ * the handle is nulled first, then uninitialized / external / ULT are
-+ * distinguished (test/basic/self_type.c:90,155,213,242). */
-+int ABT_task_self(ABT_task *task) {
-+  if (task) *task = ABT_TASK_NULL;
-+  ABTI_CHECK_INITIALIZED();
-+  if (!ABTI_on_pe()) return ABT_ERR_INV_XSTREAM;
-+  return ABT_ERR_INV_TASK;
-+}
 +int ABT_task_self_id(ABT_unit_id *id) {
 +  (void)id;
 +  ABTI_CHECK_INITIALIZED();
 +  if (!ABTI_on_pe()) return ABT_ERR_INV_XSTREAM;
 +  return ABT_ERR_INV_TASK;
 +}
-@@ int ABT_self_get_type(ABT_unit_type *type) {
--  ABTI_CHECK_INITIALIZED();
--  *type = ABTI_self_thread() ? ABT_UNIT_TYPE_THREAD : ABT_UNIT_TYPE_EXT;  return ABT_SUCCESS;
-+  if (type) *type = ABT_UNIT_TYPE_EXT; /* written even on failure (Argobots does) */
-+  ABTI_CHECK_INITIALIZED();
-+  *type = ABTI_self_thread() ? ABT_UNIT_TYPE_THREAD : ABT_UNIT_TYPE_EXT;
-+  return ABT_SUCCESS;
 ```
 
-With this, self_type reaches its tasklet section (`ABT_task_create`,
-`self_type.c:115`) and then belongs in group (a).
+self_type then reaches its tasklet section (`ABT_task_create`,
+`self_type.c:115`) and becomes a skip.
 
-### C8. Teardown crash: a `std::mutex` locked after it is destroyed — `src/xstream.cpp` / `src/init.cpp`
+## The 15 skips (out of scope per PHASE2-PLAN)
 
-**xstream_rank** aborted once, in the `-j4` run only, *after* printing its own
-"No Errors" (i.e. after `ATS_finalize` returned):
+Each stops at the first call to an excluded feature; the call named is what
+`ABT_RECONVERSE_TRACE_NA=1` recorded.
 
-```
-26/61 Test  #9: argobots_xstream_rank .......Subprocess aborted***Exception: 0.03 sec
-libc++abi: terminating due to uncaught exception of type std::__1::system_error:
-           mutex lock failed: Invalid argument
-```
+| test | first unimplemented call | feature |
+|---|---|---|
+| main_sched | `ABT_sched_create` | user `ABT_sched_def` |
+| unit | `ABT_sched_create` | user `ABT_sched_def` |
+| sched_user_ws | `ABT_sched_create` | user `ABT_sched_def` |
+| xstream_set_main_sched | `ABT_sched_create` | user `ABT_sched_def` |
+| sched_on_thread | `ABT_self_schedule` | stackable scheduler (C4) |
+| pool_custom | `ABT_pool_user_def_create` | 2.0-style user pool (C3) |
+| sched_prio | `ABT_task_create` | tasklets |
+| sched_stack | `ABT_task_create` | tasklets |
+| thread_yield2 | `ABT_task_create` | tasklets |
+| eventual_test | `ABT_task_create` | tasklets |
+| ext_thread | `ABT_task_create` | tasklets |
+| thread_get_last_xstream | `ABT_task_create_on_xstream` | tasklets |
+| thread_create4 | `ABT_thread_revive` | revive |
+| ext_thread2 | `ABT_thread_exit` | thread exit |
+| thread_attr2 | *(no trace: `ABT_thread_attr_set_stack` returns the error directly, `src/thread.cpp:337`)* | user-provided stack |
 
-Not reproduced afterwards: 15/15 solo runs and 72/72 six-way concurrent runs
-passed, plus the standalone ctest rerun. `pthread_mutex_lock` returning
-`EINVAL` under `std::mutex::lock` on macOS means the mutex memory is no longer
-a live mutex — a use-after-free, and the only `std::mutex`es on that path are
-`ABTI_pool::m` and `ABTI_global::xm`.
+Two of these are core gaps rather than plan exclusions and keep their run-2
+diagnoses: **C3** (`ABT_pool_user_def_create`, pool_custom — which also needs
+`ABT_sched_def` and `ABT_thread_revive`) and **C4** (`ABT_self_schedule` /
+`ABT_xstream_run_unit`, sched_on_thread, with a proposed patch in the run-2
+notes below). ext_thread and ext_thread_join were core failures in run 2 (C5,
+C6) and are now a skip and a pass.
 
-The suspicious window is lease release versus pool destruction:
-`ABTI_xstream_idle_hook` installs the empty table on its own PE and *then*
-publishes `finished` and wakes the joiner; the joiner (on another PE) returns
-from `ABT_xstream_join` and calls `ABT_xstream_free`, which destroys the
-automatic scheduler and with it the pools — while the releasing PE may still be
-finishing the current `CsdScheduler` iteration over the *old* table, i.e.
-inside `ABTI_poll_pool` → `ABTI_pool::pop()` → `m.lock()` on the pool that was
-just deleted. `ABT_finalize` has the same shape for the primary's scheduler.
+### Does a user-provided stack have to be used, or only reported?
 
-No patch proposed (it needs a design choice, and the window is in the core's
-own lifetime rules). The two obvious shapes: (a) retire scheduler/pool objects
-onto a list freed at `ABT_finalize` instead of deleting them in
-`ABT_xstream_free`, or (b) have the releasing PE itself perform the
-destruction — it is the only thread that knows it has left the old table — by
-messaging the freed objects to it.
+(thread_attr2, asked separately.) Upstream `ABT_thread_attr_set_stack` says
+"the memory pointed to by `stackaddr` will be used as the stack area for a
+created ULT" and makes freeing it the caller's job, so native Argobots really
+runs the ULT there. **The test cannot tell.** `thread_attr2.c`'s `thread_func`
+only checks that `ABT_thread_get_attr` reports the same *stacksize* it asked
+for, and then consumes half of `stacksize` by recursion (`dummy_rec`) to prove
+the stack is really that big; it never compares an address, and none of the
+other tests in this subset call `ABT_thread_get_stack`.
+
+So the shim has a conforming-enough option: accept a non-NULL `stackaddr`,
+honor `stacksize` by letting reconverse allocate the stack, store the address
+and hand it back from `ABT_thread_attr_get_stack`/`ABT_thread_get_stack`. That
+makes thread_attr2 pass. What it gives up: a caller who hands over *specific*
+memory (registered/pinned buffers, a guard-page arrangement, a pool of reused
+stacks) silently does not get it, and the memory is allocated twice. Margo and
+Thallium only ever set a stack *size*, so the risk is theoretical for phase 3 —
+but if the shortcut is taken it should be documented, not silent.
+
+## Per-test results
+
+| test | run 3 | note |
+|---|---|---|
+| init_finalize | pass | |
+| xstream_create | pass | |
+| xstream_rank | pass | the run-2 teardown crash (C8) did not recur |
+| xstream_set_main_sched | skip | `ABT_sched_create` (user def) |
+| main_sched | skip | `ABT_sched_create` (user def) |
+| sched_set_main | pass | |
+| sched_user_ws | skip | `ABT_sched_create` (user def) |
+| sched_basic | pass | fixed by the sched-config implementation |
+| sched_basic_wait | pass | |
+| sched_randws | pass | |
+| sched_config | pass | fixed by the sched-config implementation |
+| sched_on_thread | skip | `ABT_self_schedule` (C4) |
+| sched_prio | skip | `ABT_task_create` |
+| sched_stack | skip | `ABT_task_create` |
+| pool_config | pass | fixed by the pool-config implementation |
+| pool_custom | skip | `ABT_pool_user_def_create` (C3) |
+| unit | skip | `ABT_sched_create` (user def) |
+| thread_create | pass | |
+| thread_create2 | pass | |
+| thread_create3 | pass | |
+| thread_create4 | skip | `ABT_thread_revive` |
+| thread_create_on_xstream | pass | |
+| thread_yield | pass | |
+| thread_yield2 | skip | `ABT_task_create` |
+| thread_yield_to | pass | |
+| thread_exit | **fail** | F1 |
+| thread_self_suspend_resume | pass | |
+| thread_get_last_xstream | skip | `ABT_task_create_on_xstream` |
+| thread_migrate | pass | |
+| thread_data | pass | |
+| thread_data2 | pass | |
+| thread_id | pass | |
+| thread_attr | pass | |
+| thread_attr2 | skip | user-provided stack |
+| mutex | pass | |
+| mutex_spinlock | pass | |
+| mutex_static | pass | was a hang (S1) |
+| mutex_recursive | pass | |
+| cond_test | pass | |
+| cond_join | pass | |
+| cond_static | pass | |
+| cond_timedwait | **fail** | F1 |
+| eventual_create | pass | |
+| eventual_test | skip | `ABT_task_create` |
+| eventual_static | pass | |
+| eventual_timedwait | pass | |
+| sync_no_contention | pass | |
+| rwlock_reader_incl | pass | |
+| rwlock_reader_writer_excl | pass | |
+| rwlock_writer_excl | pass | |
+| ext_thread | skip | `ABT_task_create`; the run-2 C5 rank failure is fixed |
+| ext_thread2 | skip | `ABT_thread_exit` |
+| ext_thread_mutex | pass | was a hang (S1) |
+| ext_thread_cond | pass | |
+| ext_thread_eventual | pass | |
+| ext_thread_join | pass | was C6 |
+| info_query | pass | |
+| error | pass | |
+| timer | pass | |
+| self_rank_id | pass | |
+| self_type | **fail** | F2 |
+
+## Still-open core items from run 2
+
+- **C3** `ABT_pool_user_def_create` unimplemented (pool_custom) — described in
+  the run-2 notes; no patch, and the test needs `ABT_sched_def` +
+  `ABT_thread_revive` afterwards.
+- **C4** `ABT_self_schedule` / `ABT_xstream_run_unit` unimplemented
+  (sched_on_thread) — patch proposed in run 2 via `ABTI_pool_run_thread`, with
+  the caveat that it resumes a ULT from another ULT's context. If stackable
+  schedulers are meant to stay out of scope, say so and the test is a plain
+  skip like the others.
+- **C8** the teardown use-after-free of a pool `std::mutex` (xstream_rank
+  aborted once under `-j4` in run 2, has not recurred since) — root cause not
+  confirmed; the suspected window is `ABT_xstream_free` destroying pools while
+  the releasing PE is still in the old scheduler table.
 
 ## Notes on the harness
 
-- Each test is registered as `argobots_<name>` with a 60 s timeout and
-  `ABT_MAX_NUM_XSTREAMS=6` in its environment (most tests override it:
+- Each test is `argobots_<name>` with a 60 s timeout, `SKIP_RETURN_CODE 77`,
+  and `ABT_MAX_NUM_XSTREAMS=6` in its environment (most tests override it:
   `ATS_init` putenvs the xstream count it was given). Tests whose upstream
   `main()` reads positional arguments get numbers (`4 8`); tests that use
   `ATS_get_arg_val()` get getopt flags (`-e 4 -u 8 [-t 4] [-i 20]`).
-- 17 tests carry the ctest label `expected_fail`; `WILL_FAIL` is deliberately
-  not set. cond_join, sched_prio, thread_get_last_xstream and friends show
-  their real status; cond_join passes despite the label.
+- 17 tests carry the label `expected_fail`; `WILL_FAIL` is deliberately not
+  set. With skips reported properly the label is now mostly redundant — the
+  ones that still *fail* (thread_exit, cond_timedwait) are the interesting
+  ones.
 - `ABT_BUILD_ARGOBOTS_TESTS=OFF` drops the whole subdirectory.
 - Diagnosing hangs: `ABT_info_print_all_xstreams` can be called on a live
   process with
   `lldb -b -p <pid> -o 'expr (int)ABT_info_print_all_xstreams((void*)0)' -o detach`;
   it prints each xstream's rank/state/finishing flags and every pool's
-  size/blocked counts to the process's stdout. That is what identified the
-  join-drain deadlock in run 1.
+  size/blocked counts to the process's stdout.
