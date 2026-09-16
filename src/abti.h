@@ -42,6 +42,30 @@ struct ABTI_thread;
 struct ABTI_sched;
 struct ABTI_xstream;
 
+static inline void ABTI_cpu_relax() {
+#if defined(__x86_64__) || defined(__i386__)
+  __builtin_ia32_pause();
+#elif defined(__aarch64__)
+  __asm__ __volatile__("yield");
+#endif
+}
+/* test-and-test-and-set spinlock; held for a handful of instructions */
+struct ABTI_spinlock {
+  std::atomic<bool> f{false};
+  void lock() {
+    for (;;) {
+      if (!f.exchange(true, std::memory_order_acquire)) return;
+      while (f.load(std::memory_order_relaxed)) ABTI_cpu_relax();
+    }
+  }
+  void unlock() { f.store(false, std::memory_order_release); }
+};
+/* intrusive link for the lock-free MPSC pool path */
+struct ABTI_qnode {
+  std::atomic<ABTI_qnode *> next{nullptr};
+  ABTI_thread *owner = nullptr;  /* NULL for a pool's stub node */
+};
+
 struct ABTI_pool {
   ABT_pool_access access;
   ABT_pool_kind kind;
@@ -50,25 +74,51 @@ struct ABTI_pool {
   bool user;                  /* user-defined (ABT_pool_def) pool */
   ABT_pool_def def;           /* copy of the user's definition */
   void *data;                 /* ABT_pool_set_data */
-  /* built-in storage: one mutex + deque for every access mode (Argobots
-   * likewise uses a single spinlocked implementation for all shared modes) */
-  std::mutex m;
-  std::deque<ABTI_thread *> q;
-  /* waiting pops (basic_wait idle hook): signaled by every push */
+  /* Built-in storage keeps Argobots' semantics (global FIFO across producers)
+   * with two intrusive implementations chosen by access mode, the way
+   * Argobots' pool_fifo chooses between its private and its spinlocked path:
+   *  - PRIV / SPSC / MPSC (one consuming PE; DAOS declares its pools MPSC):
+   *    a lock-free intrusive MPSC queue (Vyukov). A push is one exchange and
+   *    one store; the consumer takes the pool spinlock only so that a pool
+   *    polled from two PEs against the rules degrades to serialized pops
+   *    instead of corrupting the queue.
+   *  - SPMC / MPMC (Margo's shared RPC pools, the predefined schedulers'
+   *    pools): an intrusive doubly linked list under the spinlock; O(1) push,
+   *    pop and remove. The primary ULT (resumable only by its home PE) sits
+   *    at most one node deep, so skipping it is O(1) too.
+   * No std::mutex on either path. Idle PEs are woken through an atomic
+   * sleeper mask, only when one is actually parked. */
+  bool single_consumer = false;    /* access <= MPSC */
+  ABTI_spinlock lk;
+  /* lock-free MPSC path */
+  ABTI_qnode stub;
+  std::atomic<ABTI_qnode *> tail{&stub};
+  ABTI_qnode *head = &stub;        /* consumer side, under lk */
+  /* spinlocked list path */
+  ABTI_thread *lhead = nullptr, *ltail = nullptr;
+  std::atomic<long> count{0};      /* units in the pool, exact */
+  /* waiting pops (pop_timedwait): Dekker-style against count, seq_cst */
+  std::mutex wm;
   std::condition_variable cv;
   std::atomic<int> waiters{0};
   std::atomic<long> num_blocked{0}; /* ULTs of this pool currently blocked */
   std::atomic<int> num_scheds{0};   /* schedulers holding this pool */
-  /* PEs parked in CsdIdleWait waiting for this pool (basic_wait idle hook) */
-  std::mutex sm;
-  std::vector<int> sleepers;
+  /* PEs parked in CsdIdleWait waiting for this pool (one bit per rank) */
+  std::atomic<int> nsleepers{0};
+  std::atomic<uint64_t> smask[4] = {};
   void add_sleeper(int rank);
   void remove_sleeper(int rank);
+  void wake_after_push();
 
   void push(ABTI_thread *t);            /* legal from any thread */
   ABTI_thread *pop();                   /* NULL when empty */
   ABTI_thread *pop_timedwait(double abs_deadline);
   size_t size();
+  ABTI_thread *pop_mpsc();              /* internals of pop() */
+  ABTI_thread *pop_list();
+  void list_unlink(ABTI_thread *t);     /* caller holds lk */
+  bool remove_unit(ABTI_thread *t);     /* ABT_pool_remove on a built-in pool */
+  template <class F> void for_each_unit(F f); /* diagnostics only; defined below ABTI_thread */
 };
 
 struct ABTI_sched {
@@ -117,6 +167,11 @@ struct ABTI_thread_attr {
 };
 
 struct ABTI_thread {
+  ABTI_thread() { qn.owner = this; }
+  ABTI_qnode qn;                          /* lock-free MPSC pool link */
+  ABTI_thread *lprev = nullptr, *lnext = nullptr; /* spinlocked pool list links */
+  std::atomic<bool> in_pool{false};       /* linked into a built-in pool */
+  std::atomic<bool> removed{false};       /* ABT_pool_remove on the MPSC path: skipped at pop */
   CthThread cth;
   ABTI_pool *pool;            /* associated pool ("last pool") */
   ABT_unit unit;              /* unit in a user pool, else NULL */
@@ -139,6 +194,17 @@ struct ABTI_thread {
   std::atomic<int> tstate{0}; /* tasklets (cth == NULL): CTH_STATE_READY/RUNNING/TERMINATED */
   std::jmp_buf exit_jmp;      /* ABT_thread_exit longjmps back to the entry frame */
 };
+
+template <class F> void ABTI_pool::for_each_unit(F f) {
+  lk.lock();
+  if (single_consumer) {
+    for (ABTI_qnode *n = head->next.load(std::memory_order_acquire); n; n = n->next.load(std::memory_order_acquire))
+      if (n->owner && !n->owner->removed.load(std::memory_order_relaxed)) f(n->owner);
+  } else {
+    for (ABTI_thread *t = lhead; t; t = t->lnext) f(t);
+  }
+  lk.unlock();
+}
 
 struct ABTI_key {
   void (*destructor)(void *);

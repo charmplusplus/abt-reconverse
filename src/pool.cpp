@@ -18,34 +18,121 @@ static ABTI_thread *unit_to_thread(ABT_unit u) {
   return it == ABTI_g->units.end() ? nullptr : it->second;
 }
 
-void ABTI_pool::push(ABTI_thread *t) {
-  if (user) {
-    def.p_push(ABTI_pool_handle(this), t->unit);
-  } else {
-    std::lock_guard<std::mutex> g(m);
-    q.push_back(t);
-  }
-  if (waiters.load(std::memory_order_acquire) > 0) {
-    std::lock_guard<std::mutex> g(m);
-    cv.notify_one();
-  }
-  {
-    std::lock_guard<std::mutex> g(sm);
-    for (int r : sleepers) CsdIdleNotify(r);
-  }
-}
-
-void ABTI_pool::add_sleeper(int rank) { std::lock_guard<std::mutex> g(sm); sleepers.push_back(rank); }
-void ABTI_pool::remove_sleeper(int rank) {
-  std::lock_guard<std::mutex> g(sm);
-  for (size_t i = 0; i < sleepers.size(); i++) if (sleepers[i] == rank) { sleepers.erase(sleepers.begin() + i); break; }
-}
-
 /* The primary ULT is a member of its pool like any other ULT (FIFO order
  * matters: Margo's monitoring test expects a handler woken earlier to run
  * before the primary), but its token can only be resumed by its home PE. */
 static inline bool pinned_elsewhere(ABTI_thread *t) {
   return t->type == ABTI_THREAD_PRIMARY && CthGetHomeRank(t->cth) != CmiMyRank();
+}
+
+void ABTI_pool::add_sleeper(int rank) {
+  smask[rank >> 6].fetch_or(1ull << (rank & 63), std::memory_order_acq_rel);
+  nsleepers.fetch_add(1, std::memory_order_seq_cst);
+}
+void ABTI_pool::remove_sleeper(int rank) {
+  smask[rank >> 6].fetch_and(~(1ull << (rank & 63)), std::memory_order_acq_rel);
+  nsleepers.fetch_sub(1, std::memory_order_seq_cst);
+}
+
+/* After the unit is visible (count incremented, seq_cst): a parked timed pop
+ * and any PE parked in CsdIdleWait for this pool are woken. Both waiters
+ * publish themselves (waiters / nsleepers, seq_cst) before re-checking
+ * count, so either they see the unit or we see them. Under load neither
+ * counter is set and this is two loads. */
+void ABTI_pool::wake_after_push() {
+  if (waiters.load(std::memory_order_seq_cst) > 0) {
+    std::lock_guard<std::mutex> g(wm);
+    cv.notify_one();
+  }
+  if (nsleepers.load(std::memory_order_seq_cst) > 0) {
+    for (int w = 0; w < 4; w++) {
+      uint64_t m = smask[w].load(std::memory_order_acquire);
+      while (m) { CsdIdleNotify(w * 64 + __builtin_ctzll(m)); m &= m - 1; }
+    }
+  }
+}
+
+void ABTI_pool::push(ABTI_thread *t) {
+  if (user) {
+    def.p_push(ABTI_pool_handle(this), t->unit);
+    wake_after_push();
+    return;
+  }
+  if (t->in_pool.exchange(true, std::memory_order_acq_rel))
+    CmiAbort("abt: a unit was pushed into a pool it is already queued in "
+             "(a ULT made ready twice, or re-pushed after ABT_pool_remove on an MPSC pool)\n");
+  if (single_consumer) {
+    t->qn.next.store(nullptr, std::memory_order_relaxed);
+    ABTI_qnode *prev = tail.exchange(&t->qn, std::memory_order_acq_rel);
+    prev->next.store(&t->qn, std::memory_order_release);
+  } else {
+    lk.lock();
+    t->lnext = nullptr;
+    t->lprev = ltail;
+    if (ltail) ltail->lnext = t; else lhead = t;
+    ltail = t;
+    lk.unlock();
+  }
+  count.fetch_add(1, std::memory_order_seq_cst);
+  wake_after_push();
+}
+
+void ABTI_pool::list_unlink(ABTI_thread *t) {
+  if (t->lprev) t->lprev->lnext = t->lnext; else lhead = t->lnext;
+  if (t->lnext) t->lnext->lprev = t->lprev; else ltail = t->lprev;
+  t->lprev = t->lnext = nullptr;
+}
+
+ABTI_thread *ABTI_pool::pop_list() {
+  lk.lock();
+  ABTI_thread *t = lhead;
+  if (t && pinned_elsewhere(t)) t = t->lnext; /* only one primary exists */
+  if (t) {
+    list_unlink(t);
+    t->in_pool.store(false, std::memory_order_release);
+  }
+  lk.unlock();
+  if (t) count.fetch_sub(1, std::memory_order_seq_cst);
+  return t;
+}
+
+/* Vyukov's intrusive MPSC queue: producers exchange the tail and link, the
+ * consumer walks from head. A pop that finds a producer between its exchange
+ * and its link returns NULL; the unit is seen at the next poll. */
+ABTI_thread *ABTI_pool::pop_mpsc() {
+  lk.lock();
+  for (;;) {
+    ABTI_qnode *h = head;
+    ABTI_qnode *next = h->next.load(std::memory_order_acquire);
+    if (h == &stub) {
+      if (!next) { lk.unlock(); return nullptr; }
+      head = h = next;
+      next = next->next.load(std::memory_order_acquire);
+    }
+    if (!next) {
+      if (h != tail.load(std::memory_order_acquire)) { lk.unlock(); return nullptr; }
+      /* h is the last node: re-append the stub so h can be detached */
+      stub.next.store(nullptr, std::memory_order_relaxed);
+      ABTI_qnode *prev = tail.exchange(&stub, std::memory_order_acq_rel);
+      prev->next.store(&stub, std::memory_order_release);
+      next = h->next.load(std::memory_order_acquire);
+      if (!next) { lk.unlock(); return nullptr; }
+    }
+    head = next;
+    ABTI_thread *t = h->owner;
+    t->in_pool.store(false, std::memory_order_release);
+    if (t->removed.exchange(false, std::memory_order_acq_rel)) continue; /* ABT_pool_remove: count already adjusted */
+    lk.unlock();
+    count.fetch_sub(1, std::memory_order_seq_cst);
+    if (pinned_elsewhere(t)) {
+      /* a single-consumer pool polled by a PE that is not the primary's home:
+       * outside Argobots' rules; keep the unit for its home PE and report
+       * empty for this poll (no livelock: the poller goes idle as usual) */
+      push(t);
+      return nullptr;
+    }
+    return t;
+  }
 }
 
 ABTI_thread *ABTI_pool::pop() {
@@ -60,14 +147,7 @@ ABTI_thread *ABTI_pool::pop() {
     }
     return t;
   }
-  std::lock_guard<std::mutex> g(m);
-  for (auto it = q.begin(); it != q.end(); ++it) {
-    if (pinned_elsewhere(*it)) continue;
-    ABTI_thread *t = *it;
-    q.erase(it);
-    return t;
-  }
-  return nullptr;
+  return single_consumer ? pop_mpsc() : pop_list();
 }
 
 ABTI_thread *ABTI_pool::pop_timedwait(double abs_deadline) {
@@ -78,29 +158,39 @@ ABTI_thread *ABTI_pool::pop_timedwait(double abs_deadline) {
   double now = CmiWallTimer();
   if (abs_deadline <= now) return nullptr;
   auto dur = std::chrono::duration<double>(abs_deadline - now);
-  std::unique_lock<std::mutex> g(m);
-  waiters.fetch_add(1, std::memory_order_acq_rel);
-  if (user) {
-    cv.wait_for(g, dur); /* push notifies; re-check through the user's pop */
-    waiters.fetch_sub(1, std::memory_order_acq_rel);
-    g.unlock();
-    return pop();
+  {
+    std::unique_lock<std::mutex> g(wm);
+    waiters.fetch_add(1, std::memory_order_seq_cst);
+    if (user) cv.wait_for(g, dur); /* push notifies; re-check through the user's pop */
+    else if (count.load(std::memory_order_seq_cst) == 0)
+      cv.wait_for(g, dur, [this] { return count.load(std::memory_order_seq_cst) > 0; });
+    waiters.fetch_sub(1, std::memory_order_seq_cst);
   }
-  cv.wait_for(g, dur, [this] { return !q.empty(); });
-  waiters.fetch_sub(1, std::memory_order_acq_rel);
-  for (auto it = q.begin(); it != q.end(); ++it) {
-    if (pinned_elsewhere(*it)) continue;
-    t = *it;
-    q.erase(it);
-    return t;
-  }
-  return nullptr;
+  return pop();
 }
 
 size_t ABTI_pool::size() {
   if (user) return def.p_get_size(ABTI_pool_handle(this));
-  std::lock_guard<std::mutex> g(m);
-  return q.size();
+  long c = count.load(std::memory_order_seq_cst);
+  return c > 0 ? (size_t)c : 0;
+}
+
+bool ABTI_pool::remove_unit(ABTI_thread *t) {
+  bool hit = false;
+  lk.lock();
+  if (t->in_pool.load(std::memory_order_acquire) && t->pool == this) {
+    if (single_consumer) {
+      /* cannot unlink under producers: mark it, pop skips it */
+      if (!t->removed.exchange(true, std::memory_order_acq_rel)) hit = true;
+    } else {
+      list_unlink(t);
+      t->in_pool.store(false, std::memory_order_release);
+      hit = true;
+    }
+  }
+  lk.unlock();
+  if (hit) count.fetch_sub(1, std::memory_order_seq_cst);
+  return hit;
 }
 
 ABTI_pool *ABTI_pool_create_builtin(ABT_pool_kind kind, ABT_pool_access access, ABT_bool automatic) {
@@ -111,6 +201,7 @@ ABTI_pool *ABTI_pool_create_builtin(ABT_pool_kind kind, ABT_pool_access access, 
   p->id = ABTI_g->next_id.fetch_add(1);
   p->user = false;
   p->data = nullptr;
+  p->single_consumer = access <= ABT_POOL_ACCESS_MPSC;
   return p;
 }
 
@@ -319,16 +410,13 @@ int ABT_pool_remove(ABT_pool pool, ABT_unit unit) {
   ABTI_pool *p = ABTI_pool_get(pool); ABTI_CHECK_NULL(p, ABT_ERR_INV_POOL);
   if (p->user) { if (p->def.p_remove) p->def.p_remove(pool, unit); return ABT_SUCCESS; }
   ABTI_thread *t = reinterpret_cast<ABTI_thread *>(unit);
-  std::lock_guard<std::mutex> g(p->m);
-  auto it = std::find(p->q.begin(), p->q.end(), t);
-  if (it != p->q.end()) p->q.erase(it);
+  p->remove_unit(t);
   return ABT_SUCCESS;
 }
 int ABT_pool_print_all(ABT_pool pool, void *arg, void (*print_fn)(void *, ABT_unit)) {
   ABTI_pool *p = ABTI_pool_get(pool); ABTI_CHECK_NULL(p, ABT_ERR_INV_POOL);
   if (p->user) { if (p->def.p_print_all) p->def.p_print_all(pool, arg, print_fn); return ABT_SUCCESS; }
-  std::lock_guard<std::mutex> g(p->m);
-  for (ABTI_thread *t : p->q) print_fn(arg, (ABT_unit)t);
+  p->for_each_unit([&](ABTI_thread *t) { print_fn(arg, (ABT_unit)t); });
   return ABT_SUCCESS;
 }
 int ABT_pool_pop_thread(ABT_pool pool, ABT_thread *thread) {
@@ -373,8 +461,7 @@ int ABT_pool_pop_wait_thread_ex(ABT_pool pool, ABT_thread *thread, double time_s
 int ABT_pool_print_all_threads(ABT_pool pool, void *arg, void (*print_f)(void *, ABT_thread)) {
   ABTI_pool *p = ABTI_pool_get(pool); ABTI_CHECK_NULL(p, ABT_ERR_INV_POOL);
   if (p->user) return ABT_ERR_FEATURE_NA;
-  std::lock_guard<std::mutex> g(p->m);
-  for (ABTI_thread *t : p->q) print_f(arg, ABTI_thread_handle(t));
+  p->for_each_unit([&](ABTI_thread *t) { print_f(arg, ABTI_thread_handle(t)); });
   return ABT_SUCCESS;
 }
 int ABT_unit_get_thread(ABT_unit unit, ABT_thread *thread) {
