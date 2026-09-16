@@ -204,7 +204,7 @@ void ABTI_xstream_install(ABTI_xstream *xs) {
    * so the PE knows its xstream before the new table can pop a ULT. A user
    * scheduler gets the built-in table only: its own loop pops the pools. */
   send_pe_msg(xs->rank, xs, ABTI_OP_LEASE, xs->cpubind, ABTI_g->lease_handler.load());
-  if (xs->main_sched->user_def) CsdSchedTableInstall(xs->rank, CsdSchedTableCreate(nullptr, 0));
+  if (xs->main_sched->user_def) CsdSchedTableInstall(xs->rank, CsdSchedTableCreateEx(nullptr, 0, ABTI_LEASED_PE_BUILTINS));
   else CsdSchedTableInstall(xs->rank, ABTI_sched_build_table(xs->main_sched));
 }
 
@@ -326,7 +326,7 @@ int ABT_xstream_set_main_sched(ABT_xstream xstream, ABT_sched sched) {
   s->used_by = x;
   if (old) old->used_by = nullptr;
   if (s->user_def) {
-    CsdSchedTableInstall(x->rank, CsdSchedTableCreate(nullptr, 0));
+    CsdSchedTableInstall(x->rank, CsdSchedTableCreateEx(nullptr, 0, ABTI_LEASED_PE_BUILTINS));
     if (old && old->user_def) old->request.fetch_or(ABTI_SCHED_REQ_EXIT); /* its runner returns, ours starts after */
     if (ABTI_on_pe() && CmiMyRank() == x->rank) ABTI_start_runner(s);
     else send_pe_msg(x->rank, x, ABTI_OP_LEASE, x->cpubind, ABTI_g->lease_handler.load());

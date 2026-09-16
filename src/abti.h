@@ -23,6 +23,12 @@
 #include <unordered_map>
 #include <vector>
 
+/* The runtime queues a leased PE polls between its pools: the PE, self and
+ * node queues carry tokens and lease/release messages; a leased PE never
+ * receives prioritized awakens, and this library runs without a comm
+ * backend, so those entries are not registered (Kale, 2026-09-16). */
+#define ABTI_LEASED_PE_BUILTINS CSD_BUILTIN_MESSAGING
+
 /* ---- debug trace: ABT_RECONVERSE_DEBUG=1 prints key runtime events to stderr ---- */
 extern int ABTI_debug;
 #define ABTI_DBG(...) do { if (ABTI_debug) { fprintf(stderr, "[abt pe%d] ", CmiIsPeThread() ? CmiMyRank() : -1); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)

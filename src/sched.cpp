@@ -106,14 +106,14 @@ CsdSchedTable ABTI_sched_build_table(ABTI_sched *s) {
     for (int i = 0; i < n; i++) s->prio_ctx.push_back(ABTI_sched::PrioCtx{s, i});
     for (int i = 0; i < n; i++)
       entries.push_back(CsdPollEntry{ABTI_poll_pool_prio, &s->prio_ctx[i], 16, "abt prio pool"});
-    return CsdSchedTableCreate(entries.data(), n);
+    return CsdSchedTableCreateEx(entries.data(), n, ABTI_LEASED_PE_BUILTINS);
   }
   for (int i = 0; i < n; i++) {
     unsigned freq = 16;
     if (s->predef == ABT_SCHED_RANDWS) freq = i == 0 ? 32 : 4;
     entries.push_back(CsdPollEntry{ABTI_poll_pool, s->pools[i], freq, "abt pool"});
   }
-  return CsdSchedTableCreate(entries.data(), n);
+  return CsdSchedTableCreateEx(entries.data(), n, ABTI_LEASED_PE_BUILTINS);
 }
 
 /* ---- stackable schedulers ---------------------------------------------
