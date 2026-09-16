@@ -52,6 +52,17 @@ CthThread ABTI_choose_fn(void) {
       int mi = ABTI_pool_index(xs->main_sched, me->pool), ti = ABTI_pool_index(xs->main_sched, t->pool);
       if (ti > mi) { ABTI_held = t; ABTI_stat_parked.fetch_add(1, std::memory_order_relaxed); t = nullptr; }
     }
+    /* A PE-main thread (the primary ULT) is resumed only through its token
+     * handler, CthResumeSchedulingThread, which parks the current standin
+     * and makes the main thread the scheduling thread again. Resuming it
+     * directly skipped that hand-off: its next suspend found no sleeping
+     * standin and created one (256 KB stack, nested scheduler loop) every
+     * time -- 1 GB/s of RSS and a 10x slowdown on Anvil (DAOS-STEP4G.md). */
+    if (t && t->cth && CthIsPeMainThread(t->cth)) {
+      ABTI_held = t;
+      ABTI_stat_parked.fetch_add(1, std::memory_order_relaxed);
+      t = nullptr;
+    }
     if (t) {
       if (t->cth) {
         if (!CthClaimReady(t->cth))
