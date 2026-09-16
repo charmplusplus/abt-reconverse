@@ -22,7 +22,7 @@ static ABTI_thread *ABTI_thread_alloc() {
 }
 static void ABTI_thread_release(ABTI_thread *t) {
   t->~ABTI_thread();
-  if (ABTI_thread_cache.size() < 1024) ABTI_thread_cache.push_back(static_cast<void *>(t));
+  if (ABTI_thread_cache.size() < 256) ABTI_thread_cache.push_back(static_cast<void *>(t));
   else ::operator delete(static_cast<void *>(t));
 }
 
