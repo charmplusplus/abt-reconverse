@@ -172,23 +172,25 @@ struct ABTI_thread {
   ABTI_thread *lprev = nullptr, *lnext = nullptr; /* spinlocked pool list links */
   std::atomic<bool> in_pool{false};       /* linked into a built-in pool */
   std::atomic<bool> removed{false};       /* ABT_pool_remove on the MPSC path: skipped at pop */
-  CthThread cth;
-  ABTI_pool *pool;            /* associated pool ("last pool") */
-  ABT_unit unit;              /* unit in a user pool, else NULL */
-  ABTI_thread_type type;
-  void (*fn)(void *);
-  void *arg;
-  ABTI_thread_attr attr;
-  uint64_t id;
-  ABTI_xstream *last_xstream;
-  ABTI_pool *migrate_to;      /* deferred ABT_thread_migrate_to_pool */
+  /* every member has an initializer: the user-provided constructor above
+   * turns off value-initialization, and descriptors are recycled */
+  CthThread cth = nullptr;
+  ABTI_pool *pool = nullptr;  /* associated pool ("last pool") */
+  ABT_unit unit = ABT_UNIT_NULL; /* unit in a user pool, else NULL */
+  ABTI_thread_type type{};
+  void (*fn)(void *) = nullptr;
+  void *arg = nullptr;
+  ABTI_thread_attr attr{};
+  uint64_t id = 0;
+  ABTI_xstream *last_xstream = nullptr;
+  ABTI_pool *migrate_to = nullptr; /* deferred ABT_thread_migrate_to_pool */
   std::atomic<int> terminated{0};
   std::mutex jm;
   std::vector<CthThread> joiners;
   std::vector<void *> keys;   /* ABT_key values, indexed by key id */
-  bool freed_by_exit;         /* detached: struct deleted in the exit fn */
-  bool is_task;               /* created by ABT_task_create: a tasklet, run as a small ULT */
-  ABTI_pool *blocked_pool;    /* pool whose num_blocked this thread holds while BLOCKED */
+  bool freed_by_exit = false; /* detached: struct deleted in the exit fn */
+  bool is_task = false;       /* created by ABT_task_create: a tasklet, run as a small ULT */
+  ABTI_pool *blocked_pool = nullptr; /* pool whose num_blocked this thread holds while BLOCKED */
   CthThread parent = nullptr; /* the ULT that resumed this one (a scheduler runner or ABT_self_schedule caller); it gets control back when this one suspends */
   std::atomic<int> blocked_counted{0};
   std::atomic<int> tstate{0}; /* tasklets (cth == NULL): CTH_STATE_READY/RUNNING/TERMINATED */

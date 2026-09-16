@@ -5,6 +5,27 @@
 #include <cstring>
 #include <sched.h>
 
+/* Per-OS-thread cache of descriptor memory. A ULT per request (Margo, DAOS)
+ * allocates and frees one ABTI_thread per ULT; with the stack and the Cth
+ * struct cached in reconverse, new/delete of this object was the next largest
+ * per-ULT cost (DAOS pilot step 4). The destructor and constructor still run;
+ * only the allocator is bypassed. */
+#include <new>
+static thread_local std::vector<void *> ABTI_thread_cache;
+static ABTI_thread *ABTI_thread_alloc() {
+  if (!ABTI_thread_cache.empty()) {
+    void *m = ABTI_thread_cache.back();
+    ABTI_thread_cache.pop_back();
+    return new (m) ABTI_thread();
+  }
+  return new ABTI_thread();
+}
+static void ABTI_thread_release(ABTI_thread *t) {
+  t->~ABTI_thread();
+  if (ABTI_thread_cache.size() < 1024) ABTI_thread_cache.push_back(static_cast<void *>(t));
+  else ::operator delete(static_cast<void *>(t));
+}
+
 #if defined(__clang__) || defined(__GNUC__)
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 #endif
@@ -46,7 +67,7 @@ void ABTI_thread_terminated(ABTI_thread *t) {
   for (CthThread j : joiners) CthAwakenIfBlocked(j);
   if (t->type == ABTI_THREAD_DETACHED) {
     ABTI_pool_disassociate(t);
-    delete t; /* a ULT's CthThread is freed by reconverse; a tasklet has none */
+    ABTI_thread_release(t); /* a ULT's CthThread is freed by reconverse; a tasklet has none */
   }
 }
 
@@ -90,7 +111,7 @@ static void runner_awaken_fn(CthThread cth, void *arg) {
   CmiPushPE(t->last_xstream ? t->last_xstream->rank : CmiMyRank(), CthGetToken(cth));
 }
 ABTI_thread *ABTI_thread_wrap_runner(CthThread cth, ABTI_pool *pool) {
-  ABTI_thread *t = new ABTI_thread();
+  ABTI_thread *t = ABTI_thread_alloc();
   t->cth = cth;
   t->type = ABTI_THREAD_SCHED;
   t->fn = nullptr; t->arg = nullptr;
@@ -105,7 +126,7 @@ ABTI_thread *ABTI_thread_wrap_runner(CthThread cth, ABTI_pool *pool) {
 }
 
 ABTI_thread *ABTI_thread_wrap_primary(CthThread cth, ABTI_pool *pool) {
-  ABTI_thread *t = new ABTI_thread();
+  ABTI_thread *t = ABTI_thread_alloc();
   t->cth = cth;
   t->type = ABTI_THREAD_PRIMARY;
   t->fn = nullptr; t->arg = nullptr;
@@ -140,7 +161,7 @@ int ABTI_thread_join_impl(ABTI_thread *t) {
 void ABTI_thread_destroy(ABTI_thread *t) {
   ABTI_pool_disassociate(t);
   if (t->cth && ABTI_on_pe()) CthFree(t->cth); /* off-PE the stack is leaked rather than freed unsafely */
-  delete t;
+  ABTI_thread_release(t);
 }
 
 static ABT_thread_state map_state(ABTI_thread *t) {
@@ -182,7 +203,7 @@ static int thread_create_impl(ABT_pool pool, void (*thread_func)(void *), void *
     ABTI_run_on_pe(create_on_pe2, &r);
     return r.ret;
   }
-  ABTI_thread *t = new ABTI_thread();
+  ABTI_thread *t = ABTI_thread_alloc();
   t->type = newthread ? ABTI_THREAD_NAMED : ABTI_THREAD_DETACHED;
   t->fn = thread_func; t->arg = arg;
   t->attr = ABTI_attr_get(attr) ? *ABTI_attr_get(attr) : ABTI_thread_attr{0, nullptr, ABT_TRUE};
@@ -576,7 +597,7 @@ static int task_create_impl(ABT_pool pool, void (*fn)(void *), void *arg, ABT_ta
   ABTI_CHECK_INITIALIZED();
   ABTI_pool *p = ABTI_pool_get(pool);
   ABTI_CHECK_NULL(p, ABT_ERR_INV_POOL);
-  ABTI_thread *t = new ABTI_thread();
+  ABTI_thread *t = ABTI_thread_alloc();
   t->cth = nullptr;
   t->type = newtask ? ABTI_THREAD_NAMED : ABTI_THREAD_DETACHED;
   t->fn = fn; t->arg = arg;
