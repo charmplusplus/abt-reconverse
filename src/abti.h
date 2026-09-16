@@ -53,9 +53,17 @@ static inline void ABTI_cpu_relax() {
 struct ABTI_spinlock {
   std::atomic<bool> f{false};
   void lock() {
+    /* test-and-test-and-set with bounded exponential backoff: under
+     * contention (several PEs on one shared pool, a shared mutex's wait
+     * list) contenders back off instead of hammering the line; DAOS-STEP4B
+     * saw contended-mutex throughput fall 3x with a plain spin */
+    unsigned pause = 1;
     for (;;) {
       if (!f.exchange(true, std::memory_order_acquire)) return;
-      while (f.load(std::memory_order_relaxed)) ABTI_cpu_relax();
+      do {
+        for (unsigned i = 0; i < pause; i++) ABTI_cpu_relax();
+        if (pause < 64) pause <<= 1;
+      } while (f.load(std::memory_order_relaxed));
     }
   }
   void unlock() { f.store(false, std::memory_order_release); }
