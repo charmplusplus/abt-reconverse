@@ -234,7 +234,10 @@ struct ABTI_global {
   ABTI_thread *primary_thread;
   std::atomic<uint64_t> next_id{1};
   std::atomic<int> next_key{0};
-  /* user-pool units -> threads (Argobots keeps the same map) */
+  /* user-pool units -> threads (Argobots keeps the same map); consulted only
+   * while a user-defined pool exists (DAOS has none: its run_unit path then
+   * touches neither the mutex nor the map, DISPATCH-LADDER.md item E) */
+  std::atomic<int> num_user_pools{0};
   std::mutex um;
   std::unordered_map<void *, ABTI_thread *> units;
   /* reconverse handler indices (same on every PE; first registrant records,

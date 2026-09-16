@@ -13,6 +13,7 @@
 
 static ABTI_thread *unit_to_thread(ABT_unit u) {
   if (ABTI_is_null_handle(u)) return nullptr;
+  if (ABTI_g->num_user_pools.load(std::memory_order_acquire) == 0) return nullptr; /* no user pool: units are thread pointers */
   std::lock_guard<std::mutex> g(ABTI_g->um);
   auto it = ABTI_g->units.find((void *)u);
   return it == ABTI_g->units.end() ? nullptr : it->second;
@@ -207,6 +208,11 @@ ABTI_pool *ABTI_pool_create_builtin(ABT_pool_kind kind, ABT_pool_access access, 
 
 void ABTI_pool_destroy(ABTI_pool *p) {
   if (p->user && p->def.p_free) p->def.p_free(ABTI_pool_handle(p));
+  /* the count stays raised while any unit of this pool may still be looked
+   * up; a freed pool's units are freed with it (ABTI_pool_disassociate), so
+   * decrementing here is safe only once no thread references them -- keep
+   * it conservative: never decrement (a process with user pools keeps the
+   * map path; DAOS never creates one) */
   delete p;
 }
 
@@ -328,6 +334,7 @@ int ABT_pool_create(ABT_pool_user_def def, ABT_pool_config config, ABT_pool *new
     int ret = d->p_init(ABTI_pool_handle(p), config);
     if (ret != ABT_SUCCESS) { delete p; return ret; }
   }
+  ABTI_g->num_user_pools.fetch_add(1, std::memory_order_acq_rel);
   *newpool = ABTI_pool_handle(p);
   return ABT_SUCCESS;
 }

@@ -80,6 +80,16 @@ set(ABT_SOURCES
     src/misc.cpp)
 
 add_library(abt_objs OBJECT ${ABT_SOURCES})
+# libabt.so is loaded at program start by every consumer (DAOS, Margo,
+# Thallium, Yokan), never dlopen'ed, so its thread_locals can use the
+# initial-exec TLS model: a direct %fs load instead of a __tls_get_addr call
+# (DISPATCH-LADDER.md). Pair with -DRECONVERSE_TLS_MODEL=initial-exec on the
+# reconverse build, whose Cpv variables are the bulk of the accesses. Set to
+# an empty string for a dlopen'ed use.
+set(ABT_TLS_MODEL "initial-exec" CACHE STRING "TLS model for the shim's thread-local variables (empty for compiler default)")
+if(ABT_TLS_MODEL)
+  target_compile_options(abt_objs PRIVATE -ftls-model=${ABT_TLS_MODEL})
+endif()
 set_target_properties(abt_objs PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_options(abt_objs PRIVATE -Wall -Wextra)
 target_include_directories(abt_objs PRIVATE
