@@ -95,25 +95,28 @@ void ABTI_sched_destroy(ABTI_sched *s) {
   delete s;
 }
 
+static ABTI_thread *sched_pop_by_policy(ABTI_sched *s);
+
+/* One table entry per predefined scheduler, not one per pool: every poll
+ * applies the scheduler's pool policy (Argobots' basic loop restarts from
+ * pools[0] after every unit; prio is the same order; randws takes pools[0]
+ * then a random other), so the scheduler's sweep-locality re-polls keep that
+ * policy instead of bursting on whichever pool produced the last unit.
+ * Margo's primary ES has [__primary__, progress] and a progress unit can
+ * block 100 ms in HG_Progress; bursting on the progress pool's own slot
+ * delayed the primary ULT by K such units (DAOS-STEP4E.md 9.1). */
+int ABTI_poll_sched(void *ctx) {
+  ABTI_sched *s = static_cast<ABTI_sched *>(ctx);
+  ABTI_thread *t = sched_pop_by_policy(s);
+  if (!t) return 0;
+  CsdReleaseIdle();
+  ABTI_pool_run_thread(t);
+  return 1;
+}
+
 CsdSchedTable ABTI_sched_build_table(ABTI_sched *s) {
-  std::vector<CsdPollEntry> entries;
-  int n = (int)s->pools.size();
-  if (s->predef == ABT_SCHED_PRIO) {
-    /* strict priority by pool index, equal slots; each entry declines while a
-     * higher-priority pool has queued work */
-    s->prio_ctx.clear();
-    s->prio_ctx.reserve(n);
-    for (int i = 0; i < n; i++) s->prio_ctx.push_back(ABTI_sched::PrioCtx{s, i});
-    for (int i = 0; i < n; i++)
-      entries.push_back(CsdPollEntry{ABTI_poll_pool_prio, &s->prio_ctx[i], 16, "abt prio pool"});
-    return CsdSchedTableCreateEx(entries.data(), n, ABTI_LEASED_PE_BUILTINS);
-  }
-  for (int i = 0; i < n; i++) {
-    unsigned freq = 16;
-    if (s->predef == ABT_SCHED_RANDWS) freq = i == 0 ? 32 : 4;
-    entries.push_back(CsdPollEntry{ABTI_poll_pool, s->pools[i], freq, "abt pool"});
-  }
-  return CsdSchedTableCreateEx(entries.data(), n, ABTI_LEASED_PE_BUILTINS);
+  CsdPollEntry e{ABTI_poll_sched, s, 16, "abt sched"};
+  return CsdSchedTableCreateEx(&e, 1, ABTI_LEASED_PE_BUILTINS);
 }
 
 /* ---- stackable schedulers ---------------------------------------------
