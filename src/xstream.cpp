@@ -16,9 +16,59 @@ thread_local CthThread ABTI_tls_runner = nullptr;
 /* where a suspending ULT returns to: the ULT that resumed it (set by
  * ABTI_pool_run_thread at every resume, so it follows the ULT through
  * stacked schedulers and ABT_self_schedule), else the PE's scheduler */
+thread_local ABTI_thread *ABTI_held = nullptr;
+thread_local unsigned ABTI_direct_count = 0;
+thread_local unsigned ABTI_last_chain = 0;
+thread_local bool ABTI_yielding = false;
+std::atomic<unsigned long> ABTI_stat_direct{0}, ABTI_stat_parked{0}, ABTI_stat_to_sched{0}, ABTI_stat_empty{0};
+
+/* Yield-to-next (experimental, Kale 2026-09-16; ABT_RECONVERSE_YIELD_TO_NEXT=K,
+ * 0 = off). Runs on the suspending ULT's stack, before the switch. When this
+ * PE runs a predefined scheduler and the ULT answers to it (no runner
+ * parent), pop the next unit by the scheduler's own policy and switch to it
+ * directly: one context switch instead of two plus a scheduler iteration.
+ * The suspending ULT's own deferred action (push back to its pool, block,
+ * terminate) still runs post-switch on the next thread's stack. A popped
+ * unit that cannot be switched to -- a stackless tasklet, which must run on
+ * the scheduler's stack -- is parked in ABTI_held and the scheduler entry
+ * runs it first; we do not push it back, since a second pop could hand us
+ * a different unit. The chain is bounded by K, then the scheduling thread
+ * gets control, sweeps its table and counts the chain toward its own burst. */
 CthThread ABTI_choose_fn(void) {
   ABTI_thread *me = static_cast<ABTI_thread *>(CthGetUserData(CthSelf()));
   if (me && me->parent) return me->parent;
+  ABTI_xstream *xs = ABTI_tls_xstream;
+  unsigned K = ABTI_g->direct_burst;
+  if (K && me && xs && xs->main_sched && !xs->main_sched->user_def && !ABTI_held &&
+      ABTI_direct_count < K && !xs->finishing.load(std::memory_order_acquire) &&
+      !(xs->main_sched->request.load() & ABTI_SCHED_REQ_EXIT)) {
+    ABTI_thread *t = ABTI_sched_pop_by_policy(xs->main_sched);
+    /* A yielding ULT is still READY but not yet back in its pool (that push
+     * is post-switch), so a pop from a LOWER-priority pool than its own is a
+     * unit Argobots' loop would not have chosen: it would have pushed 'me'
+     * first and popped 'me' again (pools are polled in order after every
+     * unit). Park such a unit; the scheduler entry runs higher pools first. */
+    if (t && ABTI_yielding && t->pool != me->pool) {
+      int mi = ABTI_pool_index(xs->main_sched, me->pool), ti = ABTI_pool_index(xs->main_sched, t->pool);
+      if (ti > mi) { ABTI_held = t; ABTI_stat_parked.fetch_add(1, std::memory_order_relaxed); t = nullptr; }
+    }
+    if (t) {
+      if (t->cth) {
+        if (!CthClaimReady(t->cth))
+          CmiAbort("abt: yield-to-next popped a ULT that is not READY (queued twice or still running)\n");
+        ABTI_direct_count++;
+        ABTI_stat_direct.fetch_add(1, std::memory_order_relaxed);
+        t->last_xstream = xs;
+        t->parent = nullptr; /* resumed on the PE's behalf, not by 'me' */
+        return t->cth;
+      }
+      ABTI_held = t; /* stackless: the scheduler entry runs it on its own stack */
+      ABTI_stat_parked.fetch_add(1, std::memory_order_relaxed);
+    } else if (!ABTI_held) ABTI_stat_empty.fetch_add(1, std::memory_order_relaxed);
+  }
+  ABTI_stat_to_sched.fetch_add(1, std::memory_order_relaxed);
+  ABTI_last_chain = ABTI_direct_count;
+  ABTI_direct_count = 0;
   return CthGetSchedulingThread();
 }
 
@@ -135,6 +185,7 @@ static void unlock_mutex(void *m) { static_cast<std::mutex *>(m)->unlock(); }
  * schedulers may hold blocked ULTs that belong to them (the joiner itself,
  * typically), so only queued work counts there. */
 static bool pools_drained(ABTI_sched *s) {
+  if (ABTI_held) return false; /* a parked unit still has to run */
   for (ABTI_pool *p : s->pools) {
     if (p->size() != 0) return false;
     if (p->num_scheds.load() <= 1 && p->num_blocked.load(std::memory_order_acquire) != 0) return false;
@@ -183,10 +234,13 @@ void ABTI_xstream_idle_hook(void *) {
       t = p0->pop_timedwait(CmiWallTimer() + 0.002);
     } else {
       int rank = CmiMyRank();
-      p0->add_sleeper(rank);
-      t = p0->pop();
-      if (!t) { CsdIdleWait(0.010); t = p0->pop(); }
-      p0->remove_sleeper(rank);
+      if (ABTI_held) { t = ABTI_held; ABTI_held = nullptr; }
+      else {
+        p0->add_sleeper(rank);
+        t = p0->pop();
+        if (!t) { CsdIdleWait(0.010); t = p0->pop(); }
+        p0->remove_sleeper(rank);
+      }
     }
     if (t) { CsdReleaseIdle(); ABTI_pool_run_thread(t); }
     return;

@@ -232,6 +232,7 @@ struct ABTI_global {
   std::atomic<int> initialized{0};
   int num_pes;                          /* == max xstreams */
   size_t default_stacksize;
+  unsigned direct_burst;                /* yield-to-next chain length, 0 = off (ABT_RECONVERSE_YIELD_TO_NEXT) */
   std::mutex xm;
   std::vector<ABTI_xstream *> xstreams; /* indexed by rank; NULL = free */
   std::vector<pthread_t> pe_threads;    /* the PE pthreads, recorded by per_pe_setup on each PE */
@@ -281,6 +282,19 @@ inline ABTI_thread *ABTI_thread_get(ABT_thread h) { return ABTI_obj<ABTI_thread>
 inline ABT_thread ABTI_thread_handle(ABTI_thread *t) { return t ? reinterpret_cast<ABT_thread>(t) : ABT_THREAD_NULL; }
 inline ABTI_thread_attr *ABTI_attr_get(ABT_thread_attr h) { return ABTI_obj<ABTI_thread_attr>(h); }
 inline ABTI_key *ABTI_key_get(ABT_key h) { return ABTI_obj<ABTI_key>(h); }
+
+/* yield-to-next (experimental): a suspending ULT pops the next unit of this
+ * PE's predefined scheduler itself and switches to it directly. A popped
+ * unit that cannot be switched to (stackless) is parked here for the
+ * scheduler entry, which runs it first; the chain length since the last
+ * return to the scheduling thread bounds the burst. */
+extern thread_local ABTI_thread *ABTI_held;
+extern thread_local unsigned ABTI_direct_count;
+extern thread_local unsigned ABTI_last_chain;
+extern thread_local bool ABTI_yielding; /* inside ABT_thread_yield: the suspending ULT stays READY */
+extern std::atomic<unsigned long> ABTI_stat_direct, ABTI_stat_parked, ABTI_stat_to_sched, ABTI_stat_empty; /* ABT_RECONVERSE_STATS=1 prints at finalize */
+ABTI_thread *ABTI_sched_pop_by_policy(ABTI_sched *s);
+int ABTI_pool_index(ABTI_sched *s, ABTI_pool *p);
 
 /* the calling context */
 inline bool ABTI_on_pe() { return CmiIsPeThread() != 0; }

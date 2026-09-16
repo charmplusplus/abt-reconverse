@@ -134,6 +134,8 @@ int ABT_init(int argc, char **argv) {
     ABTI_global *G = new ABTI_global();
     G->num_pes = ABTI_num_pes_rule();
     G->default_stacksize = (size_t)env_long("ABT_THREAD_STACKSIZE", 2 * 1024 * 1024);
+    { const char *v = getenv("ABT_RECONVERSE_YIELD_TO_NEXT"); /* 0 disables the direct switch */
+      G->direct_burst = (v && *v) ? (unsigned)strtoul(v, nullptr, 10) : 16u; }
     if (G->default_stacksize < 16384) G->default_stacksize = 16384;
     G->xstreams.assign(G->num_pes, nullptr);
     G->pe_threads.assign(G->num_pes, pthread_t());
@@ -177,11 +179,14 @@ int ABT_finalize(void) {
   ABTI_global *G = ABTI_g;
   ABTI_xstream *xs = G->primary_xstream;
   ABTI_thread *pt = G->primary_thread;
+  if (getenv("ABT_RECONVERSE_STATS"))
+    fprintf(stderr, "abt-reconverse stats: direct switches %lu, parked stackless %lu, returns to scheduler %lu (pool empty %lu)\n",
+            ABTI_stat_direct.load(), ABTI_stat_parked.load(), ABTI_stat_to_sched.load(), ABTI_stat_empty.load());
   ABTI_DBG("finalize: draining primary pools");
   /* work still queued in the primary's pools runs first (Argobots' finalize
    * lets the primary scheduler drain); each yield puts us behind it */
   for (;;) {
-    size_t queued = 0;
+    size_t queued = ABTI_held ? 1 : 0;
     for (ABTI_pool *p : xs->main_sched->pools) queued += p->size();
     if (queued == 0) break;
     CthYield();

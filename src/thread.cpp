@@ -266,7 +266,9 @@ int ABT_thread_yield(void) {
   ABTI_CHECK_INITIALIZED();
   ABTI_thread *t = ABTI_self_thread();
   if (!t || t->is_task) return ABT_SUCCESS; /* external thread or tasklet: no-op (Argobots 1.x) */
+  ABTI_yielding = true;
   CthYield();
+  ABTI_yielding = false;
   return ABT_SUCCESS;
 }
 int ABT_thread_yield_to(ABT_thread thread) { return ABT_thread_yield(); }

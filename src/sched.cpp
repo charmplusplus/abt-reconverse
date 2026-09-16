@@ -95,7 +95,6 @@ void ABTI_sched_destroy(ABTI_sched *s) {
   delete s;
 }
 
-static ABTI_thread *sched_pop_by_policy(ABTI_sched *s);
 
 /* One table entry per predefined scheduler, not one per pool: every poll
  * applies the scheduler's pool policy (Argobots' basic loop restarts from
@@ -105,13 +104,32 @@ static ABTI_thread *sched_pop_by_policy(ABTI_sched *s);
  * Margo's primary ES has [__primary__, progress] and a progress unit can
  * block 100 ms in HG_Progress; bursting on the progress pool's own slot
  * delayed the primary ULT by K such units (DAOS-STEP4E.md 9.1). */
+/* index of p among the scheduler's pools; pools.size() when absent */
+int ABTI_pool_index(ABTI_sched *s, ABTI_pool *p) {
+  int n = (int)s->pools.size();
+  for (int i = 0; i < n; i++) if (s->pools[i] == p) return i;
+  return n;
+}
+
 int ABTI_poll_sched(void *ctx) {
   ABTI_sched *s = static_cast<ABTI_sched *>(ctx);
-  ABTI_thread *t = sched_pop_by_policy(s);
+  ABTI_thread *t = nullptr;
+  if (ABTI_held) {
+    /* a unit parked by the direct-switch path: units of higher-priority
+     * pools (in policy order) still go first, then the parked one */
+    int hi = ABTI_pool_index(s, ABTI_held->pool);
+    for (int i = 0; i < hi && !t; i++) t = s->pools[i]->pop();
+    if (!t) { t = ABTI_held; ABTI_held = nullptr; }
+  } else {
+    t = ABTI_sched_pop_by_policy(s);
+  }
   if (!t) return 0;
   CsdReleaseIdle();
+  ABTI_last_chain = 0;
   ABTI_pool_run_thread(t);
-  return 1;
+  /* the unit may have chained directly to others before coming back here:
+   * report them so the scheduler's sweep burst counts them */
+  return 1 + (int)ABTI_last_chain;
 }
 
 CsdSchedTable ABTI_sched_build_table(ABTI_sched *s) {
@@ -140,7 +158,7 @@ static bool sched_has_unit(ABTI_sched *s) {
   return false;
 }
 
-static ABTI_thread *sched_pop_by_policy(ABTI_sched *s) {
+ABTI_thread *ABTI_sched_pop_by_policy(ABTI_sched *s) {
   int n = (int)s->pools.size();
   if (n == 0) return nullptr;
   if (s->predef == ABT_SCHED_RANDWS && n > 1) {
@@ -162,7 +180,7 @@ static void stacked_sched_main(void *arg) {
     int rank = CmiMyRank();
     for (;;) {
       if (s->request.load() & ABTI_SCHED_REQ_EXIT) break;
-      if (ABTI_thread *t = sched_pop_by_policy(s)) { ABTI_pool_run_thread(t); continue; }
+      if (ABTI_thread *t = ABTI_sched_pop_by_policy(s)) { ABTI_pool_run_thread(t); continue; }
       if (!sched_has_unit(s)) break; /* drained: finish (Argobots: "used in pool -> finish it anyway") */
       /* only blocked ULTs left: hold the PE until one of them is pushed back */
       for (ABTI_pool *p : s->pools) p->add_sleeper(rank);
